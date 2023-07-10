@@ -267,7 +267,8 @@ pub async fn shutdown_all_tenants() {
                 let (_guard, shutdown_progress) = completion::channel();
                 let freeze_and_flush = true;
                 if let Err(progress) = tenant.shutdown(shutdown_progress, freeze_and_flush).await {
-                    // there is already something else shutting down the tnenat (detach, ignore), lets wait for it
+                    drop(_guard);
+                    // there is already something else shutting down the tenant (detach, ignore), lets wait for it
                     let mut remaining = std::pin::pin!(progress.wait());
                     let remaining = tokio::select! {
                         biased;
