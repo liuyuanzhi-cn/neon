@@ -45,6 +45,7 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use self::config::TenantConf;
+use self::delete::DeleteTenantFlow;
 use self::metadata::TimelineMetadata;
 use self::remote_timeline_client::RemoteTimelineClient;
 use self::timeline::EvictionTaskTenantState;
@@ -92,6 +93,7 @@ mod remote_timeline_client;
 pub mod storage_layer;
 
 pub mod config;
+pub mod delete;
 pub mod mgr;
 pub mod tasks;
 pub mod upload_queue;
@@ -118,6 +120,8 @@ pub use crate::tenant::timeline::WalReceiverInfo;
 pub const TIMELINES_SEGMENT_NAME: &str = "timelines";
 
 pub const TENANT_ATTACHING_MARKER_FILENAME: &str = "attaching";
+
+pub const TENANT_DELETED_MARKER_FILE_NAME: &str = "deleted";
 
 ///
 /// Tenant consists of multiple timelines. Keep them in a hash table.
@@ -157,6 +161,8 @@ pub struct Tenant {
     cached_synthetic_tenant_size: Arc<AtomicU64>,
 
     eviction_task_tenant_state: tokio::sync::Mutex<EvictionTaskTenantState>,
+
+    pub delete_progress: Arc<tokio::sync::Mutex<DeleteTenantFlow>>,
 }
 
 /// A timeline with some of its files on disk, being initialized.
@@ -495,6 +501,7 @@ impl std::fmt::Display for WaitToBecomeActiveError {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum ShutdownError {
     AlreadyStopping,
 }
@@ -783,7 +790,7 @@ impl Tenant {
         // For every timeline, download the metadata file, scan the local directory,
         // and build a layer map that contains an entry for each remote and local
         // layer file.
-        let sorted_timelines = tree_sort_timelines(timeline_ancestors)?;
+        let sorted_timelines = tree_sort_timelines(timeline_ancestors, |m| m.ancestor_timeline())?;
         for (timeline_id, remote_metadata) in sorted_timelines {
             let (index_part, remote_client) = remote_index_and_client
                 .remove(&timeline_id)
@@ -1128,9 +1135,11 @@ impl Tenant {
 
         // Sort the array of timeline IDs into tree-order, so that parent comes before
         // all its children.
-        tree_sort_timelines(timelines_to_load).map(|sorted_timelines| TenantDirectoryScan {
-            sorted_timelines_to_load: sorted_timelines,
-            timelines_to_resume_deletion,
+        tree_sort_timelines(timelines_to_load, |m| m.ancestor_timeline()).map(|sorted_timelines| {
+            TenantDirectoryScan {
+                sorted_timelines_to_load: sorted_timelines,
+                timelines_to_resume_deletion,
+            }
         })
     }
 
@@ -1270,6 +1279,7 @@ impl Tenant {
                                         &local_metadata,
                                         Some(remote_client),
                                         init_order,
+                                        None,
                                     )
                                     .context("resume deletion")
                                 })
@@ -1319,6 +1329,7 @@ impl Tenant {
                         &local_metadata,
                         None,
                         init_order,
+                        None,
                     )
                     .context("resume deletion")
                     .map_err(LoadLocalTimelineError::ResumeDeletion)?;
@@ -1714,6 +1725,10 @@ impl Tenant {
         self.current_state() == TenantState::Active
     }
 
+    pub fn is_broken(&self) -> bool {
+        matches!(self.current_state(), TenantState::Broken { .. })
+    }
+
     /// Changes tenant status to active, unless shutdown was already requested.
     ///
     /// `background_jobs_can_start` is an optional barrier set to a value during pageserver startup
@@ -2006,22 +2021,28 @@ impl Tenant {
 /// Given a Vec of timelines and their ancestors (timeline_id, ancestor_id),
 /// perform a topological sort, so that the parent of each timeline comes
 /// before the children.
-fn tree_sort_timelines(
-    timelines: HashMap<TimelineId, TimelineMetadata>,
-) -> anyhow::Result<Vec<(TimelineId, TimelineMetadata)>> {
+/// E extracts the ancestor from T
+/// This allows for T to be different. It can be TimelineMetadata, can be Timeline itself, etc.
+fn tree_sort_timelines<T, E>(
+    timelines: HashMap<TimelineId, T>,
+    extractor: E,
+) -> anyhow::Result<Vec<(TimelineId, T)>>
+where
+    E: Fn(&T) -> Option<TimelineId>,
+{
     let mut result = Vec::with_capacity(timelines.len());
 
     let mut now = Vec::with_capacity(timelines.len());
     // (ancestor, children)
-    let mut later: HashMap<TimelineId, Vec<(TimelineId, TimelineMetadata)>> =
+    let mut later: HashMap<TimelineId, Vec<(TimelineId, T)>> =
         HashMap::with_capacity(timelines.len());
 
-    for (timeline_id, metadata) in timelines {
-        if let Some(ancestor_id) = metadata.ancestor_timeline() {
+    for (timeline_id, value) in timelines {
+        if let Some(ancestor_id) = extractor(&value) {
             let children = later.entry(ancestor_id).or_default();
-            children.push((timeline_id, metadata));
+            children.push((timeline_id, value));
         } else {
-            now.push((timeline_id, metadata));
+            now.push((timeline_id, value));
         }
     }
 
@@ -2241,6 +2262,7 @@ impl Tenant {
             cached_logical_sizes: tokio::sync::Mutex::new(HashMap::new()),
             cached_synthetic_tenant_size: Arc::new(AtomicU64::new(0)),
             eviction_task_tenant_state: tokio::sync::Mutex::new(EvictionTaskTenantState::default()),
+            delete_progress: Arc::new(tokio::sync::Mutex::new(DeleteTenantFlow::default())),
         }
     }
 

@@ -20,17 +20,19 @@ use crate::config::PageServerConf;
 use crate::context::{DownloadBehavior, RequestContext};
 use crate::task_mgr::{self, TaskKind};
 use crate::tenant::config::TenantConfOpt;
+use crate::tenant::delete::DeleteTenantFlow;
 use crate::tenant::{create_tenant_files, CreateTenantFilesMode, Tenant, TenantState};
 use crate::{InitializationOrder, IGNORED_TENANT_FILE_NAME};
 
 use utils::fs_ext::PathExt;
 use utils::id::{TenantId, TimelineId};
 
+use super::delete::DeleteTenantError;
 use super::timeline::delete::DeleteTimelineFlow;
 
 /// The tenants known to the pageserver.
 /// The enum variants are used to distinguish the different states that the pageserver can be in.
-enum TenantsMap {
+pub(crate) enum TenantsMap {
     /// [`init_tenant_mgr`] is not done yet.
     Initializing,
     /// [`init_tenant_mgr`] is done, all on-disk tenants have been loaded.
@@ -42,13 +44,13 @@ enum TenantsMap {
 }
 
 impl TenantsMap {
-    fn get(&self, tenant_id: &TenantId) -> Option<&Arc<Tenant>> {
+    pub(crate) fn get(&self, tenant_id: &TenantId) -> Option<&Arc<Tenant>> {
         match self {
             TenantsMap::Initializing => None,
             TenantsMap::Open(m) | TenantsMap::ShuttingDown(m) => m.get(tenant_id),
         }
     }
-    fn remove(&mut self, tenant_id: &TenantId) -> Option<Arc<Tenant>> {
+    pub(crate) fn remove(&mut self, tenant_id: &TenantId) -> Option<Arc<Tenant>> {
         match self {
             TenantsMap::Initializing => None,
             TenantsMap::Open(m) | TenantsMap::ShuttingDown(m) => m.remove(tenant_id),
@@ -383,6 +385,14 @@ pub async fn get_tenant(
     }
 }
 
+pub async fn delete_tenant(
+    conf: &'static PageServerConf,
+    remote_storage: Option<GenericRemoteStorage>,
+    tenant_id: TenantId,
+) -> Result<(), DeleteTenantError> {
+    DeleteTenantFlow::run(conf, remote_storage, &TENANTS, tenant_id).await
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DeleteTimelineError {
     #[error("Tenant {0}")]
@@ -398,7 +408,7 @@ pub async fn delete_timeline(
     _ctx: &RequestContext,
 ) -> Result<(), DeleteTimelineError> {
     let tenant = get_tenant(tenant_id, true).await?;
-    DeleteTimelineFlow::run(&tenant, timeline_id).await?;
+    DeleteTimelineFlow::run(&tenant, timeline_id, None).await?;
     Ok(())
 }
 

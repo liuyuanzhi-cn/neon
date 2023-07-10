@@ -208,6 +208,16 @@ impl From<crate::tenant::mgr::DeleteTimelineError> for ApiError {
     }
 }
 
+impl From<crate::tenant::delete::DeleteTenantError> for ApiError {
+    fn from(value: crate::tenant::delete::DeleteTenantError) -> Self {
+        use crate::tenant::delete::DeleteTenantError::*;
+        match value {
+            Get(g) => ApiError::from(g),
+            e => ApiError::from(e),
+        }
+    }
+}
+
 // Helper function to construct a TimelineInfo struct for a timeline
 async fn build_timeline_info(
     timeline: &Arc<Timeline>,
@@ -615,6 +625,22 @@ async fn tenant_status(
     .await?;
 
     json_response(StatusCode::OK, tenant_info)
+}
+
+async fn tenant_delete_handler(
+    request: Request<Body>,
+    _cancel: CancellationToken,
+) -> Result<Response<Body>, ApiError> {
+    let tenant_id: TenantId = parse_request_param(&request, "tenant_id")?;
+    check_permission(&request, Some(tenant_id))?;
+
+    let state = get_state(&request);
+
+    mgr::delete_tenant(state.conf, state.remote_storage.clone(), tenant_id)
+        .instrument(info_span!("tenant_status_handler", tenant = %tenant_id))
+        .await?;
+
+    json_response(StatusCode::OK, ())
 }
 
 /// HTTP endpoint to query the current tenant_size of a tenant.
@@ -1347,6 +1373,9 @@ pub fn make_router(
         .get("/v1/tenant", |r| api_handler(r, tenant_list_handler))
         .post("/v1/tenant", |r| api_handler(r, tenant_create_handler))
         .get("/v1/tenant/:tenant_id", |r| api_handler(r, tenant_status))
+        .delete("/v1/tenant/:tenant_id", |r| {
+            api_handler(r, tenant_delete_handler)
+        })
         .get("/v1/tenant/:tenant_id/synthetic_size", |r| {
             api_handler(r, tenant_size_handler)
         })

@@ -356,12 +356,14 @@ impl DeleteTimelineFlow {
     // NB: If this fails half-way through, and is retried, the retry will go through
     // all the same steps again. Make sure the code here is idempotent, and don't
     // error out if some of the shutdown tasks have already been completed!
-    #[instrument(skip(tenant), fields(tenant_id=%tenant.tenant_id))]
+    // NOTE: drop_notify is used when deletion is part of tenant deletion.
+    #[instrument(skip(tenant, drop_notify), fields(tenant_id=%tenant.tenant_id))]
     pub async fn run(
         tenant: &Arc<Tenant>,
         timeline_id: TimelineId,
+        drop_notify: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     ) -> Result<(), DeleteTimelineError> {
-        let (timeline, mut guard) = Self::prepare(tenant, timeline_id)?;
+        let (timeline, mut guard) = Self::prepare(tenant, timeline_id, drop_notify)?;
 
         guard.mark_in_progress()?;
 
@@ -395,12 +397,15 @@ impl DeleteTimelineFlow {
     }
 
     /// Shortcut to create Timeline in stopping state and spawn deletion task.
+    /// drop_notify is used when this deletion come from tenant being deleted.
+    /// See corresponding parts of [`DeleteTenantFlow`]
     pub fn resume_deletion(
         tenant: Arc<Tenant>,
         timeline_id: TimelineId,
         local_metadata: &TimelineMetadata,
         remote_client: Option<RemoteTimelineClient>,
         init_order: Option<&InitializationOrder>,
+        drop_notify: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     ) -> anyhow::Result<()> {
         let timeline = tenant
             .create_timeline_struct(
@@ -415,11 +420,14 @@ impl DeleteTimelineFlow {
             )
             .context("create_timeline_struct")?;
 
-        let mut guard = DeletionGuard(
-            Arc::clone(&timeline.delete_progress)
-                .try_lock_owned()
-                .expect("cannot happen because we're the only owner"),
-        );
+        let lock_guard = Arc::clone(&timeline.delete_progress)
+            .try_lock_owned()
+            .expect("cannot happen because we're the only owner");
+
+        let mut guard = DeletionGuard {
+            guard: lock_guard,
+            drop_notify,
+        };
 
         // Note: here we even skip populating layer map. Timeline is essentially uninitialized.
         // RemoteTimelineClient is the only functioning part.
@@ -453,6 +461,7 @@ impl DeleteTimelineFlow {
     fn prepare(
         tenant: &Tenant,
         timeline_id: TimelineId,
+        drop_notify: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     ) -> Result<(Arc<Timeline>, DeletionGuard), DeleteTimelineError> {
         let timelines = tenant.timelines.lock().unwrap();
 
@@ -478,11 +487,14 @@ impl DeleteTimelineFlow {
             return Err(DeleteTimelineError::HasChildren(children));
         }
 
-        let delete_lock_guard = DeletionGuard(
-            Arc::clone(&timeline.delete_progress)
-                .try_lock_owned()
-                .map_err(|_| DeleteTimelineError::AlreadyInProgress)?,
-        );
+        let lock_guard = Arc::clone(&timeline.delete_progress)
+            .try_lock_owned()
+            .map_err(|_| DeleteTimelineError::AlreadyInProgress)?;
+
+        let delete_lock_guard = DeletionGuard {
+            guard: lock_guard,
+            drop_notify,
+        };
 
         timeline.set_state(TimelineState::Stopping);
 
@@ -559,24 +571,27 @@ impl DeleteTimelineFlow {
 
         remove_timeline_from_tenant(tenant, timeline.timeline_id).await?;
 
-        *guard.0 = Self::Finished;
+        *guard = Self::Finished;
 
         Ok(())
     }
 }
 
-struct DeletionGuard(OwnedMutexGuard<DeleteTimelineFlow>);
+struct DeletionGuard {
+    guard: OwnedMutexGuard<DeleteTimelineFlow>,
+    drop_notify: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+}
 
 impl Deref for DeletionGuard {
     type Target = DeleteTimelineFlow;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.guard
     }
 }
 
 impl DerefMut for DeletionGuard {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.guard
     }
 }
