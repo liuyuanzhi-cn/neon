@@ -10,8 +10,16 @@ opt-level = 3
 
 [profile.dev]
 # Turn on a small amount of optimization in Development mode.
-opt-level = 1
+opt-level = 0
+incremental = true
 
 [alias]
 build_testing = ["build", "--features", "testing"]
 neon = ["run", "--bin", "neon_local"]
+
+[source.crates-io]
+registry = "https://mirrors.aliyun.com/crates.io"
+replace-with = 'ustc'
+
+[source.ustc]
+registry = "git://mirrors.ustc.edu.cn/crates.io-index"
