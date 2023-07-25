@@ -475,7 +475,7 @@ impl Timeline {
             img: cached_page_img,
         };
 
-        let timer = self.metrics.get_reconstruct_data_time_histo.start_timer();
+        let timer = crate::metrics::GET_RECONSTRUCT_DATA_TIME.start_timer();
         self.get_reconstruct_data(key, lsn, &mut reconstruct_state, ctx)
             .await?;
         timer.stop_and_record();
@@ -555,7 +555,7 @@ impl Timeline {
             "wait_lsn cannot be called in WAL receiver"
         );
 
-        let _timer = self.metrics.wait_lsn_time_histo.start_timer();
+        let _timer = crate::metrics::WAIT_LSN_TIME.start_timer();
 
         match self
             .last_record_lsn
@@ -2252,8 +2252,9 @@ impl Timeline {
         let mut timeline_owned;
         let mut timeline = self;
 
-        let mut read_count =
-            scopeguard::guard(0, |cnt| self.metrics.read_num_fs_layers.observe(cnt as f64));
+        let mut read_count = scopeguard::guard(0, |cnt| {
+            crate::metrics::READ_NUM_FS_LAYERS.observe(cnt as f64)
+        });
 
         // For debugging purposes, collect the path of layers that we traversed
         // through. It's included in the error message if we fail to find the key.
@@ -2387,12 +2388,15 @@ impl Timeline {
                             // Get all the data needed to reconstruct the page version from this layer.
                             // But if we have an older cached page image, no need to go past that.
                             let lsn_floor = max(cached_lsn + 1, start_lsn);
-                            result = match open_layer.get_value_reconstruct_data(
-                                key,
-                                lsn_floor..cont_lsn,
-                                reconstruct_state,
-                                ctx,
-                            ) {
+                            result = match open_layer
+                                .get_value_reconstruct_data(
+                                    key,
+                                    lsn_floor..cont_lsn,
+                                    reconstruct_state,
+                                    ctx,
+                                )
+                                .await
+                            {
                                 Ok(result) => result,
                                 Err(e) => return Err(PageReconstructError::from(e)),
                             };
@@ -2414,12 +2418,15 @@ impl Timeline {
                         if cont_lsn > start_lsn {
                             //info!("CHECKING for {} at {} on frozen layer {}", key, cont_lsn, frozen_layer.filename().display());
                             let lsn_floor = max(cached_lsn + 1, start_lsn);
-                            result = match frozen_layer.get_value_reconstruct_data(
-                                key,
-                                lsn_floor..cont_lsn,
-                                reconstruct_state,
-                                ctx,
-                            ) {
+                            result = match frozen_layer
+                                .get_value_reconstruct_data(
+                                    key,
+                                    lsn_floor..cont_lsn,
+                                    reconstruct_state,
+                                    ctx,
+                                )
+                                .await
+                            {
                                 Ok(result) => result,
                                 Err(e) => return Err(PageReconstructError::from(e)),
                             };
@@ -2450,12 +2457,15 @@ impl Timeline {
                             // Get all the data needed to reconstruct the page version from this layer.
                             // But if we have an older cached page image, no need to go past that.
                             let lsn_floor = max(cached_lsn + 1, lsn_floor);
-                            result = match layer.get_value_reconstruct_data(
-                                key,
-                                lsn_floor..cont_lsn,
-                                reconstruct_state,
-                                ctx,
-                            ) {
+                            result = match layer
+                                .get_value_reconstruct_data(
+                                    key,
+                                    lsn_floor..cont_lsn,
+                                    reconstruct_state,
+                                    ctx,
+                                )
+                                .await
+                            {
                                 Ok(result) => result,
                                 Err(e) => return Err(PageReconstructError::from(e)),
                             };
