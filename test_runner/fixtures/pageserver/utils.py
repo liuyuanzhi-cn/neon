@@ -194,14 +194,17 @@ def wait_for_upload_queue_empty(
 
 
 def wait_timeline_detail_404(
-    pageserver_http: PageserverHttpClient, tenant_id: TenantId, timeline_id: TimelineId
+    pageserver_http: PageserverHttpClient,
+    tenant_id: TenantId,
+    timeline_id: TimelineId,
+    iterations: int,
 ):
     last_exc = None
-    for _ in range(2):
+    for _ in range(iterations):
         time.sleep(0.250)
         try:
             data = pageserver_http.timeline_detail(tenant_id, timeline_id)
-            log.error(f"detail {data}")
+            log.info(f"detail {data}")
         except PageserverApiException as e:
             log.debug(e)
             if e.status_code == 404:
@@ -216,7 +219,8 @@ def timeline_delete_wait_completed(
     pageserver_http: PageserverHttpClient,
     tenant_id: TenantId,
     timeline_id: TimelineId,
+    iterations: int = 20,
     **delete_args,
 ):
     pageserver_http.timeline_delete(tenant_id=tenant_id, timeline_id=timeline_id, **delete_args)
-    wait_timeline_detail_404(pageserver_http, tenant_id, timeline_id)
+    wait_timeline_detail_404(pageserver_http, tenant_id, timeline_id, iterations)

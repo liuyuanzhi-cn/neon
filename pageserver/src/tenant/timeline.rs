@@ -1,3 +1,4 @@
+pub mod delete;
 mod eviction_task;
 pub mod layer_manager;
 mod logical_size;
@@ -79,6 +80,7 @@ use crate::METADATA_FILE_NAME;
 use crate::ZERO_PAGE;
 use crate::{is_temporary, task_mgr};
 
+use self::delete::DeleteTimelineFlow;
 pub(super) use self::eviction_task::EvictionTaskTenantState;
 use self::eviction_task::EvictionTaskTimelineState;
 use self::layer_manager::LayerManager;
@@ -237,11 +239,10 @@ pub struct Timeline {
 
     /// Layer removal lock.
     /// A lock to ensure that no layer of the timeline is removed concurrently by other tasks.
-    /// This lock is acquired in [`Timeline::gc`], [`Timeline::compact`],
-    /// and [`Tenant::delete_timeline`]. This is an `Arc<Mutex>` lock because we need an owned
+    /// This lock is acquired in [`Timeline::gc`] and [`Timeline::compact`].
+    /// This is an `Arc<Mutex>` lock because we need an owned
     /// lock guard in functions that will be spawned to tokio I/O pool (which requires `'static`).
-    ///
-    /// [`Tenant::delete_timeline`]: super::Tenant::delete_timeline
+    /// Note that [`DeleteTimelineFlow`] uses `delete_progress` field.
     pub(super) layer_removal_cs: Arc<tokio::sync::Mutex<()>>,
 
     // Needed to ensure that we can't create a branch at a point that was already garbage collected
@@ -283,7 +284,7 @@ pub struct Timeline {
 
     /// Prevent two tasks from deleting the timeline at the same time. If held, the
     /// timeline is being deleted. If 'true', the timeline has already been deleted.
-    pub delete_lock: Arc<tokio::sync::Mutex<bool>>,
+    pub delete_progress: Arc<tokio::sync::Mutex<DeleteTimelineFlow>>,
 
     eviction_task_timeline_state: tokio::sync::Mutex<EvictionTaskTimelineState>,
 
@@ -293,6 +294,10 @@ pub struct Timeline {
     /// Completion shared between all timelines loaded during startup; used to delay heavier
     /// background tasks until some logical sizes have been calculated.
     initial_logical_size_attempt: Mutex<Option<completion::Completion>>,
+
+    /// Load or creation time information about the disk_consistent_lsn and when the loading
+    /// happened. Used for consumption metrics.
+    pub(crate) loaded_at: (Lsn, SystemTime),
 }
 
 pub struct WalReceiverInfo {
@@ -334,7 +339,7 @@ pub struct GcInfo {
 #[derive(thiserror::Error)]
 pub enum PageReconstructError {
     #[error(transparent)]
-    Other(#[from] anyhow::Error), // source and Display delegate to anyhow::Error
+    Other(#[from] anyhow::Error),
 
     /// The operation would require downloading a layer that is missing locally.
     NeedsDownload(TenantTimelineId, LayerFileName),
@@ -523,7 +528,7 @@ impl Timeline {
         size
     }
 
-    pub fn get_resident_physical_size(&self) -> u64 {
+    pub fn resident_physical_size(&self) -> u64 {
         self.metrics.resident_physical_size_gauge.get()
     }
 
@@ -611,8 +616,45 @@ impl Timeline {
     }
 
     /// Outermost timeline compaction operation; downloads needed layers.
-    pub async fn compact(self: &Arc<Self>, ctx: &RequestContext) -> anyhow::Result<()> {
+    pub async fn compact(
+        self: &Arc<Self>,
+        cancel: &CancellationToken,
+        ctx: &RequestContext,
+    ) -> anyhow::Result<()> {
         const ROUNDS: usize = 2;
+
+        static CONCURRENT_COMPACTIONS: once_cell::sync::Lazy<tokio::sync::Semaphore> =
+            once_cell::sync::Lazy::new(|| {
+                let total_threads = *task_mgr::BACKGROUND_RUNTIME_WORKER_THREADS;
+                let permits = usize::max(
+                    1,
+                    // while a lot of the work is done on spawn_blocking, we still do
+                    // repartitioning in the async context. this should give leave us some workers
+                    // unblocked to be blocked on other work, hopefully easing any outside visible
+                    // effects of restarts.
+                    //
+                    // 6/8 is a guess; previously we ran with unlimited 8 and more from
+                    // spawn_blocking.
+                    (total_threads * 3).checked_div(4).unwrap_or(0),
+                );
+                assert_ne!(permits, 0, "we will not be adding in permits later");
+                assert!(
+                    permits < total_threads,
+                    "need threads avail for shorter work"
+                );
+                tokio::sync::Semaphore::new(permits)
+            });
+
+        // this wait probably never needs any "long time spent" logging, because we already nag if
+        // compaction task goes over it's period (20s) which is quite often in production.
+        let _permit = tokio::select! {
+            permit = CONCURRENT_COMPACTIONS.acquire() => {
+                permit
+            },
+            _ = cancel.cancelled() => {
+                return Ok(());
+            }
+        };
 
         let last_record_lsn = self.get_last_record_lsn();
 
@@ -655,6 +697,9 @@ impl Timeline {
                 Err(CompactionError::DownloadRequired(rls)) => {
                     anyhow::bail!("Compaction requires downloading multiple times (last was {} layers), possibly battling against eviction", rls.len())
                 }
+                Err(CompactionError::ShuttingDown) => {
+                    return Ok(());
+                }
                 Err(CompactionError::Other(e)) => {
                     return Err(e);
                 }
@@ -671,11 +716,9 @@ impl Timeline {
 
             let mut failed = 0;
 
-            let mut cancelled = pin!(task_mgr::shutdown_watcher());
-
             loop {
                 tokio::select! {
-                    _ = &mut cancelled => anyhow::bail!("Cancelled while downloading remote layers"),
+                    _ = cancel.cancelled() => anyhow::bail!("Cancelled while downloading remote layers"),
                     res = downloads.next() => {
                         match res {
                             Some(Ok(())) => {},
@@ -738,7 +781,8 @@ impl Timeline {
         let layer_removal_cs = Arc::new(self.layer_removal_cs.clone().lock_owned().await);
         // Is the timeline being deleted?
         if self.is_stopping() {
-            return Err(anyhow::anyhow!("timeline is Stopping").into());
+            trace!("Dropping out of compaction on timeline shutdown");
+            return Err(CompactionError::ShuttingDown);
         }
 
         let target_file_size = self.get_checkpoint_distance();
@@ -890,7 +934,7 @@ impl Timeline {
                     new_state,
                     TimelineState::Stopping | TimelineState::Broken { .. }
                 ) {
-                    // drop the copmletion guard, if any; it might be holding off the completion
+                    // drop the completion guard, if any; it might be holding off the completion
                     // forever needlessly
                     self.initial_logical_size_attempt
                         .lock()
@@ -1325,9 +1369,10 @@ impl Timeline {
         pg_version: u32,
         initial_logical_size_can_start: Option<completion::Barrier>,
         initial_logical_size_attempt: Option<completion::Completion>,
+        state: TimelineState,
     ) -> Arc<Self> {
         let disk_consistent_lsn = metadata.disk_consistent_lsn();
-        let (state, _) = watch::channel(TimelineState::Loading);
+        let (state, _) = watch::channel(state);
 
         let (layer_flush_start_tx, _) = tokio::sync::watch::channel(0);
         let (layer_flush_done_tx, _) = tokio::sync::watch::channel((0, Ok(())));
@@ -1366,6 +1411,8 @@ impl Timeline {
 
                 last_freeze_at: AtomicLsn::new(disk_consistent_lsn.0),
                 last_freeze_ts: RwLock::new(Instant::now()),
+
+                loaded_at: (disk_consistent_lsn, SystemTime::now()),
 
                 ancestor_timeline: ancestor,
                 ancestor_lsn: metadata.ancestor_lsn(),
@@ -1418,7 +1465,7 @@ impl Timeline {
                 eviction_task_timeline_state: tokio::sync::Mutex::new(
                     EvictionTaskTimelineState::default(),
                 ),
-                delete_lock: Arc::new(tokio::sync::Mutex::new(false)),
+                delete_progress: Arc::new(tokio::sync::Mutex::new(DeleteTimelineFlow::default())),
 
                 initial_logical_size_can_start,
                 initial_logical_size_attempt: Mutex::new(initial_logical_size_attempt),
@@ -1563,7 +1610,7 @@ impl Timeline {
             if let Some(imgfilename) = ImageFileName::parse_str(&fname) {
                 // create an ImageLayer struct for each image file.
                 if imgfilename.lsn > disk_consistent_lsn {
-                    warn!(
+                    info!(
                         "found future image layer {} on timeline {} disk_consistent_lsn is {}",
                         imgfilename, self.timeline_id, disk_consistent_lsn
                     );
@@ -1595,7 +1642,7 @@ impl Timeline {
                 // is 102, then it might not have been fully flushed to disk
                 // before crash.
                 if deltafilename.lsn_range.end > disk_consistent_lsn + 1 {
-                    warn!(
+                    info!(
                         "found future delta layer {} on timeline {} disk_consistent_lsn is {}",
                         deltafilename, self.timeline_id, disk_consistent_lsn
                     );
@@ -1737,7 +1784,7 @@ impl Timeline {
             match remote_layer_name {
                 LayerFileName::Image(imgfilename) => {
                     if imgfilename.lsn > up_to_date_disk_consistent_lsn {
-                        warn!(
+                        info!(
                         "found future image layer {} on timeline {} remote_consistent_lsn is {}",
                         imgfilename, self.timeline_id, up_to_date_disk_consistent_lsn
                     );
@@ -1762,7 +1809,7 @@ impl Timeline {
                     // is 102, then it might not have been fully flushed to disk
                     // before crash.
                     if deltafilename.lsn_range.end > up_to_date_disk_consistent_lsn + 1 {
-                        warn!(
+                        info!(
                             "found future delta layer {} on timeline {} remote_consistent_lsn is {}",
                             deltafilename, self.timeline_id, up_to_date_disk_consistent_lsn
                         );
@@ -1883,6 +1930,15 @@ impl Timeline {
     }
 
     fn try_spawn_size_init_task(self: &Arc<Self>, lsn: Lsn, ctx: &RequestContext) {
+        let state = self.current_state();
+        if matches!(
+            state,
+            TimelineState::Broken { .. } | TimelineState::Stopping
+        ) {
+            // Can happen when timeline detail endpoint is used when deletion is ongoing (or its broken).
+            return;
+        }
+
         let permit = match Arc::clone(&self.current_logical_size.initial_size_computation)
             .try_acquire_owned()
         {
@@ -3183,6 +3239,8 @@ enum CompactionError {
     /// This should not happen repeatedly, but will be retried once by top-level
     /// `Timeline::compact`.
     DownloadRequired(Vec<Arc<RemoteLayer>>),
+    /// The timeline or pageserver is shutting down
+    ShuttingDown,
     /// Compaction cannot be done right now; page reconstruction and so on.
     Other(anyhow::Error),
 }
@@ -3461,7 +3519,13 @@ impl Timeline {
         let mut heap: BinaryHeap<Hole> = BinaryHeap::with_capacity(max_holes + 1);
         let mut prev: Option<Key> = None;
         for (next_key, _next_lsn, _size) in itertools::process_results(
-            deltas_to_compact.iter().map(|l| l.key_iter(ctx)),
+            deltas_to_compact.iter().map(|l| -> Result<_> {
+                Ok(l.clone()
+                    .downcast_delta_layer()
+                    .expect("delta layer")
+                    .load_keys(ctx)?
+                    .into_iter())
+            }),
             |iter_iter| iter_iter.kmerge_by(|a, b| a.0 < b.0),
         )? {
             if let Some(prev_key) = prev {
@@ -3497,25 +3561,31 @@ impl Timeline {
         // This iterator walks through all key-value pairs from all the layers
         // we're compacting, in key, LSN order.
         let all_values_iter = itertools::process_results(
-            deltas_to_compact.iter().map(|l| l.iter(ctx)),
+            deltas_to_compact.iter().map(|l| -> Result<_> {
+                Ok(l.clone()
+                    .downcast_delta_layer()
+                    .expect("delta layer")
+                    .load_val_refs(ctx)?
+                    .into_iter())
+            }),
             |iter_iter| {
                 iter_iter.kmerge_by(|a, b| {
-                    if let Ok((a_key, a_lsn, _)) = a {
-                        if let Ok((b_key, b_lsn, _)) = b {
-                            (a_key, a_lsn) < (b_key, b_lsn)
-                        } else {
-                            false
-                        }
-                    } else {
-                        true
-                    }
+                    let (a_key, a_lsn, _) = a;
+                    let (b_key, b_lsn, _) = b;
+                    (a_key, a_lsn) < (b_key, b_lsn)
                 })
             },
         )?;
 
         // This iterator walks through all keys and is needed to calculate size used by each key
         let mut all_keys_iter = itertools::process_results(
-            deltas_to_compact.iter().map(|l| l.key_iter(ctx)),
+            deltas_to_compact.iter().map(|l| -> Result<_> {
+                Ok(l.clone()
+                    .downcast_delta_layer()
+                    .expect("delta layer")
+                    .load_keys(ctx)?
+                    .into_iter())
+            }),
             |iter_iter| {
                 iter_iter.kmerge_by(|a, b| {
                     let (a_key, a_lsn, _) = a;
@@ -3577,8 +3647,8 @@ impl Timeline {
         let mut key_values_total_size = 0u64;
         let mut dup_start_lsn: Lsn = Lsn::INVALID; // start LSN of layer containing values of the single key
         let mut dup_end_lsn: Lsn = Lsn::INVALID; // end LSN of layer containing values of the single key
-        for x in all_values_iter {
-            let (key, lsn, value) = x?;
+        for (key, lsn, value_ref) in all_values_iter {
+            let value = value_ref.load()?;
             let same_key = prev_key.map_or(false, |prev_key| prev_key == key);
             // We need to check key boundaries once we reach next key or end of layer with the same key
             if !same_key || lsn == dup_end_lsn {

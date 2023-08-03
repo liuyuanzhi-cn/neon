@@ -70,11 +70,17 @@ where
 pub struct ComputeMetrics {
     pub wait_for_spec_ms: u64,
     pub sync_safekeepers_ms: u64,
+    pub sync_sk_check_ms: u64,
     pub basebackup_ms: u64,
     pub basebackup_bytes: u64,
     pub start_postgres_ms: u64,
     pub config_ms: u64,
     pub total_startup_ms: u64,
+    pub load_ext_ms: u64,
+    pub num_ext_downloaded: u64,
+    pub largest_ext_size: u64, // these are measured in bytes
+    pub total_ext_download_size: u64,
+    pub prep_extensions_ms: u64,
 }
 
 /// Response of the `/computes/{compute_id}/spec` control-plane API.

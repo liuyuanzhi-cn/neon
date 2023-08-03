@@ -6,7 +6,6 @@ use metrics::{
     IntCounterVec, IntGauge, IntGaugeVec, UIntGauge, UIntGaugeVec,
 };
 use once_cell::sync::Lazy;
-use pageserver_api::models::TenantState;
 use strum::VariantNames;
 use strum_macros::{EnumVariantNames, IntoStaticStr};
 use utils::id::{TenantId, TimelineId};
@@ -74,7 +73,7 @@ pub static STORAGE_TIME_COUNT_PER_TIMELINE: Lazy<IntCounterVec> = Lazy::new(|| {
 // Buckets for background operations like compaction, GC, size calculation
 const STORAGE_OP_BUCKETS: &[f64] = &[0.010, 0.100, 1.0, 10.0, 100.0, 1000.0];
 
-pub static STORAGE_TIME_GLOBAL: Lazy<HistogramVec> = Lazy::new(|| {
+pub(crate) static STORAGE_TIME_GLOBAL: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
         "pageserver_storage_operations_seconds_global",
         "Time spent on storage operations",
@@ -94,7 +93,7 @@ pub(crate) static READ_NUM_FS_LAYERS: Lazy<Histogram> = Lazy::new(|| {
 });
 
 // Metrics collected on operations on the storage repository.
-pub static RECONSTRUCT_TIME: Lazy<Histogram> = Lazy::new(|| {
+pub(crate) static RECONSTRUCT_TIME: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!(
         "pageserver_getpage_reconstruct_seconds",
         "Time spent in reconstruct_value (reconstruct a page from deltas)",
@@ -103,7 +102,7 @@ pub static RECONSTRUCT_TIME: Lazy<Histogram> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static MATERIALIZED_PAGE_CACHE_HIT_DIRECT: Lazy<IntCounter> = Lazy::new(|| {
+pub(crate) static MATERIALIZED_PAGE_CACHE_HIT_DIRECT: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
         "pageserver_materialized_cache_hits_direct_total",
         "Number of cache hits from materialized page cache without redo",
@@ -120,7 +119,7 @@ pub(crate) static GET_RECONSTRUCT_DATA_TIME: Lazy<Histogram> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static MATERIALIZED_PAGE_CACHE_HIT: Lazy<IntCounter> = Lazy::new(|| {
+pub(crate) static MATERIALIZED_PAGE_CACHE_HIT: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
         "pageserver_materialized_cache_hits_total",
         "Number of cache hits from materialized page cache",
@@ -281,7 +280,7 @@ static REMOTE_PHYSICAL_SIZE: Lazy<UIntGaugeVec> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static REMOTE_ONDEMAND_DOWNLOADED_LAYERS: Lazy<IntCounter> = Lazy::new(|| {
+pub(crate) static REMOTE_ONDEMAND_DOWNLOADED_LAYERS: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
         "pageserver_remote_ondemand_downloaded_layers_total",
         "Total on-demand downloaded layers"
@@ -289,7 +288,7 @@ pub static REMOTE_ONDEMAND_DOWNLOADED_LAYERS: Lazy<IntCounter> = Lazy::new(|| {
     .unwrap()
 });
 
-pub static REMOTE_ONDEMAND_DOWNLOADED_BYTES: Lazy<IntCounter> = Lazy::new(|| {
+pub(crate) static REMOTE_ONDEMAND_DOWNLOADED_BYTES: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
         "pageserver_remote_ondemand_downloaded_bytes_total",
         "Total bytes of layers on-demand downloaded",
@@ -306,16 +305,29 @@ static CURRENT_LOGICAL_SIZE: Lazy<UIntGaugeVec> = Lazy::new(|| {
     .expect("failed to define current logical size metric")
 });
 
-pub static TENANT_STATE_METRIC: Lazy<UIntGaugeVec> = Lazy::new(|| {
+pub(crate) static TENANT_STATE_METRIC: Lazy<UIntGaugeVec> = Lazy::new(|| {
     register_uint_gauge_vec!(
         "pageserver_tenant_states_count",
         "Count of tenants per state",
-        &["tenant_id", "state"]
+        &["state"]
     )
     .expect("Failed to register pageserver_tenant_states_count metric")
 });
 
-pub static TENANT_SYNTHETIC_SIZE_METRIC: Lazy<UIntGaugeVec> = Lazy::new(|| {
+/// A set of broken tenants.
+///
+/// These are expected to be so rare that a set is fine. Set as in a new timeseries per each broken
+/// tenant.
+pub(crate) static BROKEN_TENANTS_SET: Lazy<UIntGaugeVec> = Lazy::new(|| {
+    register_uint_gauge_vec!(
+        "pageserver_broken_tenants_count",
+        "Set of broken tenants",
+        &["tenant_id"]
+    )
+    .expect("Failed to register pageserver_tenant_states_count metric")
+});
+
+pub(crate) static TENANT_SYNTHETIC_SIZE_METRIC: Lazy<UIntGaugeVec> = Lazy::new(|| {
     register_uint_gauge_vec!(
         "pageserver_tenant_synthetic_cached_size_bytes",
         "Synthetic size of each tenant in bytes",
@@ -373,7 +385,7 @@ static EVICTIONS_WITH_LOW_RESIDENCE_DURATION: Lazy<IntCounterVec> = Lazy::new(||
     .expect("failed to define a metric")
 });
 
-pub static UNEXPECTED_ONDEMAND_DOWNLOADS: Lazy<IntCounter> = Lazy::new(|| {
+pub(crate) static UNEXPECTED_ONDEMAND_DOWNLOADS: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
         "pageserver_unexpected_ondemand_downloads_count",
         "Number of unexpected on-demand downloads. \
@@ -678,7 +690,7 @@ pub(crate) static REMOTE_OPERATION_TIME: Lazy<HistogramVec> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static TENANT_TASK_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+pub(crate) static TENANT_TASK_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
         "pageserver_tenant_task_events",
         "Number of task start/stop/fail events.",
@@ -687,7 +699,7 @@ pub static TENANT_TASK_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("Failed to register tenant_task_events metric")
 });
 
-pub static BACKGROUND_LOOP_PERIOD_OVERRUN_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
+pub(crate) static BACKGROUND_LOOP_PERIOD_OVERRUN_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
         "pageserver_background_loop_period_overrun_count",
         "Incremented whenever warn_when_period_overrun() logs a warning.",
@@ -698,7 +710,7 @@ pub static BACKGROUND_LOOP_PERIOD_OVERRUN_COUNT: Lazy<IntCounterVec> = Lazy::new
 
 // walreceiver metrics
 
-pub static WALRECEIVER_STARTED_CONNECTIONS: Lazy<IntCounter> = Lazy::new(|| {
+pub(crate) static WALRECEIVER_STARTED_CONNECTIONS: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
         "pageserver_walreceiver_started_connections_total",
         "Number of started walreceiver connections"
@@ -706,7 +718,7 @@ pub static WALRECEIVER_STARTED_CONNECTIONS: Lazy<IntCounter> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static WALRECEIVER_ACTIVE_MANAGERS: Lazy<IntGauge> = Lazy::new(|| {
+pub(crate) static WALRECEIVER_ACTIVE_MANAGERS: Lazy<IntGauge> = Lazy::new(|| {
     register_int_gauge!(
         "pageserver_walreceiver_active_managers",
         "Number of active walreceiver managers"
@@ -714,7 +726,7 @@ pub static WALRECEIVER_ACTIVE_MANAGERS: Lazy<IntGauge> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static WALRECEIVER_SWITCHES: Lazy<IntCounterVec> = Lazy::new(|| {
+pub(crate) static WALRECEIVER_SWITCHES: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
         "pageserver_walreceiver_switches_total",
         "Number of walreceiver manager change_connection calls",
@@ -723,7 +735,7 @@ pub static WALRECEIVER_SWITCHES: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static WALRECEIVER_BROKER_UPDATES: Lazy<IntCounter> = Lazy::new(|| {
+pub(crate) static WALRECEIVER_BROKER_UPDATES: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
         "pageserver_walreceiver_broker_updates_total",
         "Number of received broker updates in walreceiver"
@@ -731,7 +743,7 @@ pub static WALRECEIVER_BROKER_UPDATES: Lazy<IntCounter> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static WALRECEIVER_CANDIDATES_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+pub(crate) static WALRECEIVER_CANDIDATES_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!(
         "pageserver_walreceiver_candidates_events_total",
         "Number of walreceiver candidate events",
@@ -740,10 +752,10 @@ pub static WALRECEIVER_CANDIDATES_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static WALRECEIVER_CANDIDATES_ADDED: Lazy<IntCounter> =
+pub(crate) static WALRECEIVER_CANDIDATES_ADDED: Lazy<IntCounter> =
     Lazy::new(|| WALRECEIVER_CANDIDATES_EVENTS.with_label_values(&["add"]));
 
-pub static WALRECEIVER_CANDIDATES_REMOVED: Lazy<IntCounter> =
+pub(crate) static WALRECEIVER_CANDIDATES_REMOVED: Lazy<IntCounter> =
     Lazy::new(|| WALRECEIVER_CANDIDATES_EVENTS.with_label_values(&["remove"]));
 
 // Metrics collected on WAL redo operations
@@ -790,7 +802,7 @@ macro_rules! redo_bytes_histogram_count_buckets {
     };
 }
 
-pub static WAL_REDO_TIME: Lazy<Histogram> = Lazy::new(|| {
+pub(crate) static WAL_REDO_TIME: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!(
         "pageserver_wal_redo_seconds",
         "Time spent on WAL redo",
@@ -799,7 +811,7 @@ pub static WAL_REDO_TIME: Lazy<Histogram> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static WAL_REDO_WAIT_TIME: Lazy<Histogram> = Lazy::new(|| {
+pub(crate) static WAL_REDO_WAIT_TIME: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!(
         "pageserver_wal_redo_wait_seconds",
         "Time spent waiting for access to the Postgres WAL redo process",
@@ -808,7 +820,7 @@ pub static WAL_REDO_WAIT_TIME: Lazy<Histogram> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static WAL_REDO_RECORDS_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
+pub(crate) static WAL_REDO_RECORDS_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!(
         "pageserver_wal_redo_records_histogram",
         "Histogram of number of records replayed per redo in the Postgres WAL redo process",
@@ -817,7 +829,7 @@ pub static WAL_REDO_RECORDS_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static WAL_REDO_BYTES_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
+pub(crate) static WAL_REDO_BYTES_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!(
         "pageserver_wal_redo_bytes_histogram",
         "Histogram of number of records replayed per redo sent to Postgres",
@@ -826,7 +838,8 @@ pub static WAL_REDO_BYTES_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-pub static WAL_REDO_RECORD_COUNTER: Lazy<IntCounter> = Lazy::new(|| {
+// FIXME: isn't this already included by WAL_REDO_RECORDS_HISTOGRAM which has _count?
+pub(crate) static WAL_REDO_RECORD_COUNTER: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
         "pageserver_replayed_wal_records_total",
         "Number of WAL records replayed in WAL redo process"
@@ -1023,9 +1036,7 @@ impl Drop for TimelineMetrics {
 pub fn remove_tenant_metrics(tenant_id: &TenantId) {
     let tid = tenant_id.to_string();
     let _ = TENANT_SYNTHETIC_SIZE_METRIC.remove_label_values(&[&tid]);
-    for state in TenantState::VARIANTS {
-        let _ = TENANT_STATE_METRIC.remove_label_values(&[&tid, state]);
-    }
+    // we leave the BROKEN_TENANTS_SET entry if any
 }
 
 use futures::Future;
@@ -1384,15 +1395,51 @@ impl<F: Future<Output = Result<O, E>>, O, E> Future for MeasuredRemoteOp<F> {
 }
 
 pub fn preinitialize_metrics() {
-    // We want to alert on this metric increasing.
-    // Initialize it eagerly, so that our alert rule can distinguish absence of the metric from metric value 0.
-    assert_eq!(UNEXPECTED_ONDEMAND_DOWNLOADS.get(), 0);
-    UNEXPECTED_ONDEMAND_DOWNLOADS.reset();
+    // Python tests need these and on some we do alerting.
+    //
+    // FIXME(4813): make it so that we have no top level metrics as this fn will easily fall out of
+    // order:
+    // - global metrics reside in a Lazy<PageserverMetrics>
+    //   - access via crate::metrics::PS_METRICS.materialized_page_cache_hit.inc()
+    // - could move the statics into TimelineMetrics::new()?
 
-    // Same as above for this metric, but, it's a Vec-type metric for which we don't know all the labels.
-    BACKGROUND_LOOP_PERIOD_OVERRUN_COUNT.reset();
+    // counters
+    [
+        &MATERIALIZED_PAGE_CACHE_HIT,
+        &MATERIALIZED_PAGE_CACHE_HIT_DIRECT,
+        &UNEXPECTED_ONDEMAND_DOWNLOADS,
+        &WALRECEIVER_STARTED_CONNECTIONS,
+        &WALRECEIVER_BROKER_UPDATES,
+        &WALRECEIVER_CANDIDATES_ADDED,
+        &WALRECEIVER_CANDIDATES_REMOVED,
+    ]
+    .into_iter()
+    .for_each(|c| {
+        Lazy::force(c);
+    });
 
-    // Python tests need these.
-    MATERIALIZED_PAGE_CACHE_HIT_DIRECT.get();
-    MATERIALIZED_PAGE_CACHE_HIT.get();
+    // countervecs
+    [&BACKGROUND_LOOP_PERIOD_OVERRUN_COUNT]
+        .into_iter()
+        .for_each(|c| {
+            Lazy::force(c);
+        });
+
+    // gauges
+    WALRECEIVER_ACTIVE_MANAGERS.get();
+
+    // histograms
+    [
+        &READ_NUM_FS_LAYERS,
+        &RECONSTRUCT_TIME,
+        &WAIT_LSN_TIME,
+        &WAL_REDO_TIME,
+        &WAL_REDO_WAIT_TIME,
+        &WAL_REDO_RECORDS_HISTOGRAM,
+        &WAL_REDO_BYTES_HISTOGRAM,
+    ]
+    .into_iter()
+    .for_each(|h| {
+        Lazy::force(h);
+    });
 }

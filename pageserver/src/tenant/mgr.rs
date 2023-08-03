@@ -26,6 +26,8 @@ use crate::{InitializationOrder, IGNORED_TENANT_FILE_NAME};
 use utils::fs_ext::PathExt;
 use utils::id::{TenantId, TimelineId};
 
+use super::timeline::delete::DeleteTimelineFlow;
+
 /// The tenants known to the pageserver.
 /// The enum variants are used to distinguish the different states that the pageserver can be in.
 enum TenantsMap {
@@ -421,12 +423,10 @@ pub enum DeleteTimelineError {
 pub async fn delete_timeline(
     tenant_id: TenantId,
     timeline_id: TimelineId,
-    ctx: &RequestContext,
+    _ctx: &RequestContext,
 ) -> Result<(), DeleteTimelineError> {
     let tenant = get_tenant(tenant_id, true).await?;
-    tenant
-        .prepare_and_schedule_delete_timeline(timeline_id, ctx)
-        .await?;
+    DeleteTimelineFlow::run(&tenant, timeline_id).await?;
     Ok(())
 }
 
@@ -760,55 +760,6 @@ pub async fn immediate_gc(
             }
             Ok(())
         }
-    );
-
-    // drop the guard until after we've spawned the task so that timeline shutdown will wait for the task
-    drop(guard);
-
-    Ok(wait_task_done)
-}
-
-pub async fn immediate_compact(
-    tenant_id: TenantId,
-    timeline_id: TimelineId,
-    ctx: &RequestContext,
-) -> Result<tokio::sync::oneshot::Receiver<anyhow::Result<()>>, ApiError> {
-    let guard = TENANTS.read().await;
-
-    let tenant = guard
-        .get(&tenant_id)
-        .map(Arc::clone)
-        .with_context(|| format!("tenant {tenant_id}"))
-        .map_err(|e| ApiError::NotFound(e.into()))?;
-
-    let timeline = tenant
-        .get_timeline(timeline_id, true)
-        .map_err(|e| ApiError::NotFound(e.into()))?;
-
-    // Run in task_mgr to avoid race with tenant_detach operation
-    let ctx = ctx.detached_child(TaskKind::Compaction, DownloadBehavior::Download);
-    let (task_done, wait_task_done) = tokio::sync::oneshot::channel();
-    task_mgr::spawn(
-        &tokio::runtime::Handle::current(),
-        TaskKind::Compaction,
-        Some(tenant_id),
-        Some(timeline_id),
-        &format!(
-            "timeline_compact_handler compaction run for tenant {tenant_id} timeline {timeline_id}"
-        ),
-        false,
-        async move {
-            let result = timeline
-                .compact(&ctx)
-                .instrument(info_span!("manual_compact", %tenant_id, %timeline_id))
-                .await;
-
-            match task_done.send(result) {
-                Ok(_) => (),
-                Err(result) => error!("failed to send compaction result: {result:?}"),
-            }
-            Ok(())
-        },
     );
 
     // drop the guard until after we've spawned the task so that timeline shutdown will wait for the task
