@@ -17,19 +17,22 @@ from fixtures.neon_fixtures import (
 from fixtures.pageserver.http import PageserverHttpClient
 from fixtures.pageserver.utils import (
     assert_tenant_state,
-    tenant_exists,
     wait_for_last_record_lsn,
     wait_for_upload,
+    wait_tenant_status_404,
 )
 from fixtures.port_distributor import PortDistributor
-from fixtures.remote_storage import RemoteStorageKind, available_remote_storages
+from fixtures.remote_storage import (
+    LocalFsStorage,
+    RemoteStorageKind,
+    available_remote_storages,
+)
 from fixtures.types import Lsn, TenantId, TimelineId
 from fixtures.utils import (
     query_scalar,
     start_in_background,
     subprocess_capture,
     wait_until,
-    wait_while,
 )
 
 
@@ -265,17 +268,22 @@ def test_tenant_relocation(
     method: str,
     with_load: str,
 ):
-    neon_env_builder.enable_local_fs_remote_storage()
+    neon_env_builder.enable_pageserver_remote_storage(RemoteStorageKind.LOCAL_FS)
 
     env = neon_env_builder.init_start()
+
+    tenant_id = TenantId("74ee8b079a0e437eb0afea7d26a07209")
 
     # FIXME: Is this expected?
     env.pageserver.allowed_errors.append(
         ".*init_tenant_mgr: marking .* as locally complete, while it doesnt exist in remote index.*"
     )
 
-    # create folder for remote storage mock
-    remote_storage_mock_path = env.repo_dir / "local_fs_remote_storage"
+    # Needed for detach polling.
+    env.pageserver.allowed_errors.append(f".*NotFound: tenant {tenant_id}.*")
+
+    assert isinstance(env.pageserver_remote_storage, LocalFsStorage)
+    remote_storage_mock_path = env.pageserver_remote_storage.root
 
     # we use two branches to check that they are both relocated
     # first branch is used for load, compute for second one is used to
@@ -283,9 +291,7 @@ def test_tenant_relocation(
 
     pageserver_http = env.pageserver.http_client()
 
-    tenant_id, initial_timeline_id = env.neon_cli.create_tenant(
-        TenantId("74ee8b079a0e437eb0afea7d26a07209")
-    )
+    _, initial_timeline_id = env.neon_cli.create_tenant(tenant_id)
     log.info("tenant to relocate %s initial_timeline_id %s", tenant_id, initial_timeline_id)
 
     env.neon_cli.create_branch("test_tenant_relocation_main", tenant_id=tenant_id)
@@ -469,11 +475,8 @@ def test_tenant_relocation(
         pageserver_http.tenant_detach(tenant_id)
 
         # Wait a little, so that the detach operation has time to finish.
-        wait_while(
-            number_of_iterations=100,
-            interval=1,
-            func=lambda: tenant_exists(pageserver_http, tenant_id),
-        )
+        wait_tenant_status_404(pageserver_http, tenant_id, iterations=100, interval=1)
+
         post_migration_check(ep_main, 500500, old_local_path_main)
         post_migration_check(ep_second, 1001000, old_local_path_second)
 
@@ -525,10 +528,7 @@ def test_emergency_relocate_with_branches_slow_replay(
     neon_env_builder: NeonEnvBuilder,
     remote_storage_kind: RemoteStorageKind,
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_emergency_relocate_with_branches_slow_replay",
-    )
+    neon_env_builder.enable_pageserver_remote_storage(remote_storage_kind)
 
     env = neon_env_builder.init_start()
     env.pageserver.is_testing_enabled_or_skip()
@@ -561,7 +561,7 @@ def test_emergency_relocate_with_branches_slow_replay(
     # simpler than initializing a new one from scratch, but the effect on the single tenant
     # is the same.
     env.pageserver.stop(immediate=True)
-    shutil.rmtree(Path(env.repo_dir) / "tenants" / str(tenant_id))
+    shutil.rmtree(env.pageserver.workdir / "tenants" / str(tenant_id))
     env.pageserver.start()
 
     # This fail point will pause the WAL ingestion on the main branch, after the
@@ -682,10 +682,7 @@ def test_emergency_relocate_with_branches_createdb(
     neon_env_builder: NeonEnvBuilder,
     remote_storage_kind: RemoteStorageKind,
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_emergency_relocate_with_branches_createdb",
-    )
+    neon_env_builder.enable_pageserver_remote_storage(remote_storage_kind)
 
     env = neon_env_builder.init_start()
     pageserver_http = env.pageserver.http_client()
@@ -712,7 +709,7 @@ def test_emergency_relocate_with_branches_createdb(
 
     # Kill the pageserver, remove the tenant directory, and restart
     env.pageserver.stop(immediate=True)
-    shutil.rmtree(Path(env.repo_dir) / "tenants" / str(tenant_id))
+    shutil.rmtree(env.pageserver.workdir / "tenants" / str(tenant_id))
     env.pageserver.start()
 
     # Wait before ingesting the WAL for CREATE DATABASE on the main branch. The original

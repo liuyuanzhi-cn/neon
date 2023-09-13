@@ -93,6 +93,47 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+    delete:
+      description: |
+        Attempts to delete specified tenant. 500 and 409 errors should be retried until 404 is retrieved.
+        404 means that deletion successfully finished"
+      responses:
+        "400":
+          description: Error when no tenant id found in path
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Unauthorized Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UnauthorizedError"
+        "403":
+          description: Forbidden Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ForbiddenError"
+        "404":
+          description: Tenant not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+        "409":
+          description: Deletion is already in progress, continue polling
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConflictError"
+        "500":
+          description: Generic operation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /v1/tenant/{tenant_id}/timeline:
     parameters:
@@ -342,7 +383,6 @@ paths:
         schema:
           type: string
           format: hex
-
     post:
       description: |
         Schedules attach operation to happen in the background for the given tenant.
@@ -820,6 +860,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+
   /v1/tenant/config:
     put:
       description: |
@@ -978,6 +1019,9 @@ components:
       properties:
         config:
           $ref: '#/components/schemas/TenantConfig'
+        generation:
+          type: integer
+          description: Attachment generation number.
     TenantConfigRequest:
       allOf:
         - $ref: '#/components/schemas/TenantConfig'

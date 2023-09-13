@@ -12,38 +12,38 @@ use crate::{
     tenant::{
         layer_map::{BatchedUpdates, LayerMap},
         storage_layer::{
-            AsLayerDesc, DeltaLayer, ImageLayer, InMemoryLayer, Layer, PersistentLayer,
-            PersistentLayerDesc, PersistentLayerKey, RemoteLayer,
+            AsLayerDesc, DeltaLayer, ImageLayer, InMemoryLayer, PersistentLayer,
+            PersistentLayerDesc, PersistentLayerKey,
         },
         timeline::compare_arced_layers,
     },
 };
 
 /// Provides semantic APIs to manipulate the layer map.
-pub struct LayerManager {
+pub(crate) struct LayerManager {
     layer_map: LayerMap,
     layer_fmgr: LayerFileManager,
 }
 
 /// After GC, the layer map changes will not be applied immediately. Users should manually apply the changes after
 /// scheduling deletes in remote client.
-pub struct ApplyGcResultGuard<'a>(BatchedUpdates<'a>);
+pub(crate) struct ApplyGcResultGuard<'a>(BatchedUpdates<'a>);
 
 impl ApplyGcResultGuard<'_> {
-    pub fn flush(self) {
+    pub(crate) fn flush(self) {
         self.0.flush();
     }
 }
 
 impl LayerManager {
-    pub fn create() -> Self {
+    pub(crate) fn create() -> Self {
         Self {
             layer_map: LayerMap::default(),
             layer_fmgr: LayerFileManager::new(),
         }
     }
 
-    pub fn get_from_desc(&self, desc: &PersistentLayerDesc) -> Arc<dyn PersistentLayer> {
+    pub(crate) fn get_from_desc(&self, desc: &PersistentLayerDesc) -> Arc<dyn PersistentLayer> {
         self.layer_fmgr.get_from_desc(desc)
     }
 
@@ -51,18 +51,12 @@ impl LayerManager {
     ///
     /// We expect users only to be able to get an immutable layer map. If users want to make modifications,
     /// they should use the below semantic APIs. This design makes us step closer to immutable storage state.
-    pub fn layer_map(&self) -> &LayerMap {
+    pub(crate) fn layer_map(&self) -> &LayerMap {
         &self.layer_map
     }
 
-    /// Get a mutable reference to the layer map. This function will be removed once `flush_frozen_layer`
-    /// gets a refactor.
-    pub fn layer_map_mut(&mut self) -> &mut LayerMap {
-        &mut self.layer_map
-    }
-
     /// Replace layers in the layer file manager, used in evictions and layer downloads.
-    pub fn replace_and_verify(
+    pub(crate) fn replace_and_verify(
         &mut self,
         expected: Arc<dyn PersistentLayer>,
         new: Arc<dyn PersistentLayer>,
@@ -73,7 +67,7 @@ impl LayerManager {
     /// Called from `load_layer_map`. Initialize the layer manager with:
     /// 1. all on-disk layers
     /// 2. next open layer (with disk disk_consistent_lsn LSN)
-    pub fn initialize_local_layers(
+    pub(crate) fn initialize_local_layers(
         &mut self,
         on_disk_layers: Vec<Arc<dyn PersistentLayer>>,
         next_open_layer_at: Lsn,
@@ -87,28 +81,13 @@ impl LayerManager {
     }
 
     /// Initialize when creating a new timeline, called in `init_empty_layer_map`.
-    pub fn initialize_empty(&mut self, next_open_layer_at: Lsn) {
+    pub(crate) fn initialize_empty(&mut self, next_open_layer_at: Lsn) {
         self.layer_map.next_open_layer_at = Some(next_open_layer_at);
-    }
-
-    pub fn initialize_remote_layers(
-        &mut self,
-        corrupted_local_layers: Vec<Arc<dyn PersistentLayer>>,
-        remote_layers: Vec<Arc<RemoteLayer>>,
-    ) {
-        let mut updates = self.layer_map.batch_update();
-        for layer in corrupted_local_layers {
-            Self::remove_historic_layer(layer, &mut updates, &mut self.layer_fmgr);
-        }
-        for layer in remote_layers {
-            Self::insert_historic_layer(layer, &mut updates, &mut self.layer_fmgr);
-        }
-        updates.flush();
     }
 
     /// Open a new writable layer to append data if there is no open layer, otherwise return the current open layer,
     /// called within `get_layer_for_write`.
-    pub fn get_layer_for_write(
+    pub(crate) async fn get_layer_for_write(
         &mut self,
         lsn: Lsn,
         last_record_lsn: Lsn,
@@ -120,10 +99,9 @@ impl LayerManager {
 
         ensure!(
             lsn > last_record_lsn,
-            "cannot modify relation after advancing last_record_lsn (incoming_lsn={}, last_record_lsn={})\n{}",
+            "cannot modify relation after advancing last_record_lsn (incoming_lsn={}, last_record_lsn={})",
             lsn,
             last_record_lsn,
-            std::backtrace::Backtrace::force_capture(),
         );
 
         // Do we have a layer open for writing already?
@@ -151,7 +129,7 @@ impl LayerManager {
                 lsn
             );
 
-            let new_layer = InMemoryLayer::create(conf, timeline_id, tenant_id, start_lsn)?;
+            let new_layer = InMemoryLayer::create(conf, timeline_id, tenant_id, start_lsn).await?;
             let layer = Arc::new(new_layer);
 
             self.layer_map.open_layer = Some(layer.clone());
@@ -164,7 +142,7 @@ impl LayerManager {
     }
 
     /// Called from `freeze_inmem_layer`, returns true if successfully frozen.
-    pub fn try_freeze_in_memory_layer(
+    pub(crate) async fn try_freeze_in_memory_layer(
         &mut self,
         Lsn(last_record_lsn): Lsn,
         last_freeze_at: &AtomicLsn,
@@ -174,7 +152,7 @@ impl LayerManager {
         if let Some(open_layer) = &self.layer_map.open_layer {
             let open_layer_rc = Arc::clone(open_layer);
             // Does this layer need freezing?
-            open_layer.freeze(end_lsn);
+            open_layer.freeze(end_lsn).await;
 
             // The layer is no longer open, update the layer map to reflect this.
             // We will replace it with on-disk historics below.
@@ -186,7 +164,7 @@ impl LayerManager {
     }
 
     /// Add image layers to the layer map, called from `create_image_layers`.
-    pub fn track_new_image_layers(&mut self, image_layers: Vec<ImageLayer>) {
+    pub(crate) fn track_new_image_layers(&mut self, image_layers: Vec<ImageLayer>) {
         let mut updates = self.layer_map.batch_update();
         for layer in image_layers {
             Self::insert_historic_layer(Arc::new(layer), &mut updates, &mut self.layer_fmgr);
@@ -195,7 +173,7 @@ impl LayerManager {
     }
 
     /// Flush a frozen layer and add the written delta layer to the layer map.
-    pub fn finish_flush_l0_layer(
+    pub(crate) fn finish_flush_l0_layer(
         &mut self,
         delta_layer: Option<DeltaLayer>,
         frozen_layer_for_check: &Arc<InMemoryLayer>,
@@ -215,7 +193,7 @@ impl LayerManager {
     }
 
     /// Called when compaction is completed.
-    pub fn finish_compact_l0(
+    pub(crate) fn finish_compact_l0(
         &mut self,
         layer_removal_cs: Arc<tokio::sync::OwnedMutexGuard<()>>,
         compact_from: Vec<Arc<dyn PersistentLayer>>,
@@ -243,7 +221,7 @@ impl LayerManager {
     }
 
     /// Called when garbage collect the timeline. Returns a guard that will apply the updates to the layer map.
-    pub fn finish_gc_timeline(
+    pub(crate) fn finish_gc_timeline(
         &mut self,
         layer_removal_cs: Arc<tokio::sync::OwnedMutexGuard<()>>,
         gc_layers: Vec<Arc<dyn PersistentLayer>>,
@@ -272,16 +250,6 @@ impl LayerManager {
         mapping.insert(layer);
     }
 
-    /// Helper function to remove a layer into the layer map and file manager
-    fn remove_historic_layer(
-        layer: Arc<dyn PersistentLayer>,
-        updates: &mut BatchedUpdates<'_>,
-        mapping: &mut LayerFileManager,
-    ) {
-        updates.remove_historic(layer.layer_desc().clone());
-        mapping.remove(layer);
-    }
-
     /// Removes the layer from local FS (if present) and from memory.
     /// Remote storage is not affected by this operation.
     fn delete_historic_layer(
@@ -292,10 +260,10 @@ impl LayerManager {
         metrics: &TimelineMetrics,
         mapping: &mut LayerFileManager,
     ) -> anyhow::Result<()> {
+        let desc = layer.layer_desc();
         if !layer.is_remote_layer() {
             layer.delete_resident_layer_file()?;
-            let layer_file_size = layer.file_size();
-            metrics.resident_physical_size_gauge.sub(layer_file_size);
+            metrics.resident_physical_size_gauge.sub(desc.file_size);
         }
 
         // TODO Removing from the bottom of the layer map is expensive.
@@ -303,7 +271,7 @@ impl LayerManager {
         //      won't be needed for page reconstruction for this timeline,
         //      and mark what we can't delete yet as deleted from the layer
         //      map index without actually rebuilding the index.
-        updates.remove_historic(layer.layer_desc().clone());
+        updates.remove_historic(desc);
         mapping.remove(layer);
 
         Ok(())
@@ -314,7 +282,7 @@ impl LayerManager {
     }
 }
 
-pub struct LayerFileManager<T: AsLayerDesc + ?Sized = dyn PersistentLayer>(
+pub(crate) struct LayerFileManager<T: AsLayerDesc + ?Sized = dyn PersistentLayer>(
     HashMap<PersistentLayerKey, Arc<T>>,
 );
 

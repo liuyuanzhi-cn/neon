@@ -8,9 +8,10 @@ use anyhow::{anyhow, Context, Result};
 use hyper::StatusCode;
 use hyper::{Body, Request, Response, Uri};
 use metrics::launch_timestamp::LaunchTimestamp;
-use pageserver_api::models::{DownloadRemoteLayersTaskSpawnRequest, TenantAttachRequest};
+use pageserver_api::models::{
+    DownloadRemoteLayersTaskSpawnRequest, TenantAttachRequest, TenantLoadRequest,
+};
 use remote_storage::GenericRemoteStorage;
-use storage_broker::BrokerClientChannel;
 use tenant_size_model::{SizeResult, StorageModel};
 use tokio_util::sync::CancellationToken;
 use tracing::*;
@@ -32,11 +33,13 @@ use crate::tenant::mgr::{
 };
 use crate::tenant::size::ModelInputs;
 use crate::tenant::storage_layer::LayerAccessStatsReset;
-use crate::tenant::{LogicalSizeCalculationCause, PageReconstructError, Timeline};
+use crate::tenant::timeline::Timeline;
+use crate::tenant::{LogicalSizeCalculationCause, PageReconstructError};
 use crate::{config::PageServerConf, tenant::mgr};
 use crate::{disk_usage_eviction_task, tenant};
 use utils::{
     auth::JwtAuth,
+    generation::Generation,
     http::{
         endpoint::{self, attach_openapi_ui, auth_middleware, check_permission_with},
         error::{ApiError, HttpErrorBody},
@@ -51,7 +54,7 @@ use utils::{
 // Imports only used for testing APIs
 use super::models::ConfigureFailpointsRequest;
 
-struct State {
+pub struct State {
     conf: &'static PageServerConf,
     auth: Option<Arc<JwtAuth>>,
     allowlist_routes: Vec<Uri>,
@@ -61,7 +64,7 @@ struct State {
 }
 
 impl State {
-    fn new(
+    pub fn new(
         conf: &'static PageServerConf,
         auth: Option<Arc<JwtAuth>>,
         remote_storage: Option<GenericRemoteStorage>,
@@ -187,7 +190,7 @@ impl From<crate::tenant::DeleteTimelineError> for ApiError {
                 format!("Cannot delete timeline which has child timelines: {children:?}")
                     .into_boxed_str(),
             ),
-            a @ AlreadyInProgress => ApiError::Conflict(a.to_string()),
+            a @ AlreadyInProgress(_) => ApiError::Conflict(a.to_string()),
             Other(e) => ApiError::InternalServerError(e),
         }
     }
@@ -204,6 +207,19 @@ impl From<crate::tenant::mgr::DeleteTimelineError> for ApiError {
             ),
             Tenant(t) => ApiError::from(t),
             Timeline(t) => ApiError::from(t),
+        }
+    }
+}
+
+impl From<crate::tenant::delete::DeleteTenantError> for ApiError {
+    fn from(value: crate::tenant::delete::DeleteTenantError) -> Self {
+        use crate::tenant::delete::DeleteTenantError::*;
+        match value {
+            Get(g) => ApiError::from(g),
+            e @ AlreadyInProgress => ApiError::Conflict(e.to_string()),
+            Timeline(t) => ApiError::from(t),
+            Other(o) => ApiError::InternalServerError(o),
+            e @ InvalidState(_) => ApiError::PreconditionFailed(e.to_string().into_boxed_str()),
         }
     }
 }
@@ -269,6 +285,8 @@ async fn build_timeline_info_common(
     let state = timeline.current_state();
     let remote_consistent_lsn = timeline.get_remote_consistent_lsn().unwrap_or(Lsn(0));
 
+    let walreceiver_status = timeline.walreceiver_status();
+
     let info = TimelineInfo {
         tenant_id: timeline.tenant_id,
         timeline_id: timeline.timeline_id,
@@ -289,6 +307,8 @@ async fn build_timeline_info_common(
         pg_version: timeline.pg_version,
 
         state,
+
+        walreceiver_status,
     };
     Ok(info)
 }
@@ -459,7 +479,7 @@ async fn tenant_attach_handler(
     check_permission(&request, Some(tenant_id))?;
 
     let maybe_body: Option<TenantAttachRequest> = json_request_or_empty_body(&mut request).await?;
-    let tenant_conf = match maybe_body {
+    let tenant_conf = match &maybe_body {
         Some(request) => TenantConfOpt::try_from(&*request.config).map_err(ApiError::BadRequest)?,
         None => TenantConfOpt::default(),
     };
@@ -470,10 +490,13 @@ async fn tenant_attach_handler(
 
     let state = get_state(&request);
 
+    let generation = get_request_generation(state, maybe_body.as_ref().and_then(|r| r.generation))?;
+
     if let Some(remote_storage) = &state.remote_storage {
         mgr::attach_tenant(
             state.conf,
             tenant_id,
+            generation,
             tenant_conf,
             state.broker_client.clone(),
             remote_storage.clone(),
@@ -504,7 +527,6 @@ async fn timeline_delete_handler(
         .instrument(info_span!("timeline_delete", %tenant_id, %timeline_id))
         .await?;
 
-    // FIXME: needs to be an error for console to retry it. Ideally Accepted should be used and retried until 404.
     json_response(StatusCode::ACCEPTED, ())
 }
 
@@ -526,7 +548,7 @@ async fn tenant_detach_handler(
 }
 
 async fn tenant_load_handler(
-    request: Request<Body>,
+    mut request: Request<Body>,
     _cancel: CancellationToken,
 ) -> Result<Response<Body>, ApiError> {
     let tenant_id: TenantId = parse_request_param(&request, "tenant_id")?;
@@ -534,10 +556,18 @@ async fn tenant_load_handler(
 
     let ctx = RequestContext::new(TaskKind::MgmtRequest, DownloadBehavior::Warn);
 
+    let maybe_body: Option<TenantLoadRequest> = json_request_or_empty_body(&mut request).await?;
+
     let state = get_state(&request);
+
+    // The /load request is only usable when control_plane_api is not set.  Once it is set, callers
+    // should always use /attach instead.
+    let generation = get_request_generation(state, maybe_body.as_ref().and_then(|r| r.generation))?;
+
     mgr::load_tenant(
         state.conf,
         tenant_id,
+        generation,
         state.broker_client.clone(),
         state.remote_storage.clone(),
         &ctx,
@@ -615,6 +645,23 @@ async fn tenant_status(
     .await?;
 
     json_response(StatusCode::OK, tenant_info)
+}
+
+async fn tenant_delete_handler(
+    request: Request<Body>,
+    _cancel: CancellationToken,
+) -> Result<Response<Body>, ApiError> {
+    // TODO openapi spec
+    let tenant_id: TenantId = parse_request_param(&request, "tenant_id")?;
+    check_permission(&request, Some(tenant_id))?;
+
+    let state = get_state(&request);
+
+    mgr::delete_tenant(state.conf, state.remote_storage.clone(), tenant_id)
+        .instrument(info_span!("tenant_delete_handler", %tenant_id))
+        .await?;
+
+    json_response(StatusCode::ACCEPTED, ())
 }
 
 /// HTTP endpoint to query the current tenant_size of a tenant.
@@ -822,6 +869,21 @@ pub fn html_response(status: StatusCode, data: String) -> Result<Response<Body>,
     Ok(response)
 }
 
+/// Helper for requests that may take a generation, which is mandatory
+/// when control_plane_api is set, but otherwise defaults to Generation::none()
+fn get_request_generation(state: &State, req_gen: Option<u32>) -> Result<Generation, ApiError> {
+    if state.conf.control_plane_api.is_some() {
+        req_gen
+            .map(Generation::new)
+            .ok_or(ApiError::BadRequest(anyhow!(
+                "generation attribute missing"
+            )))
+    } else {
+        // Legacy mode: all tenants operate with no generation
+        Ok(Generation::none())
+    }
+}
+
 async fn tenant_create_handler(
     mut request: Request<Body>,
     _cancel: CancellationToken,
@@ -838,14 +900,17 @@ async fn tenant_create_handler(
     let tenant_conf =
         TenantConfOpt::try_from(&request_data.config).map_err(ApiError::BadRequest)?;
 
-    let ctx = RequestContext::new(TaskKind::MgmtRequest, DownloadBehavior::Warn);
-
     let state = get_state(&request);
+
+    let generation = get_request_generation(state, request_data.generation)?;
+
+    let ctx = RequestContext::new(TaskKind::MgmtRequest, DownloadBehavior::Warn);
 
     let new_tenant = mgr::create_tenant(
         state.conf,
         tenant_conf,
         target_tenant_id,
+        generation,
         state.broker_client.clone(),
         state.remote_storage.clone(),
         &ctx,
@@ -950,14 +1015,7 @@ async fn failpoints_handler(
 
         // We recognize one extra "action" that's not natively recognized
         // by the failpoints crate: exit, to immediately kill the process
-        let cfg_result = if fp.actions == "exit" {
-            fail::cfg_callback(fp.name, || {
-                info!("Exit requested by failpoint");
-                std::process::exit(1);
-            })
-        } else {
-            fail::cfg(fp.name, &fp.actions)
-        };
+        let cfg_result = crate::failpoint_support::apply_failpoint(&fp.name, &fp.actions);
 
         if let Err(err_msg) = cfg_result {
             return Err(ApiError::BadRequest(anyhow!(
@@ -1299,12 +1357,9 @@ where
 }
 
 pub fn make_router(
-    conf: &'static PageServerConf,
+    state: Arc<State>,
     launch_ts: &'static LaunchTimestamp,
     auth: Option<Arc<JwtAuth>>,
-    broker_client: BrokerClientChannel,
-    remote_storage: Option<GenericRemoteStorage>,
-    disk_usage_eviction_state: Arc<disk_usage_eviction_task::State>,
 ) -> anyhow::Result<RouterBuilder<hyper::Body, ApiError>> {
     let spec = include_bytes!("openapi_spec.yml");
     let mut router = attach_openapi_ui(endpoint::make_router(), spec, "/swagger.yml", "/v1/doc");
@@ -1328,16 +1383,7 @@ pub fn make_router(
     );
 
     Ok(router
-        .data(Arc::new(
-            State::new(
-                conf,
-                auth,
-                remote_storage,
-                broker_client,
-                disk_usage_eviction_state,
-            )
-            .context("Failed to initialize router state")?,
-        ))
+        .data(state)
         .get("/v1/status", |r| api_handler(r, status_handler))
         .put("/v1/failpoints", |r| {
             testing_api_handler("manage failpoints", r, failpoints_handler)
@@ -1345,6 +1391,9 @@ pub fn make_router(
         .get("/v1/tenant", |r| api_handler(r, tenant_list_handler))
         .post("/v1/tenant", |r| api_handler(r, tenant_create_handler))
         .get("/v1/tenant/:tenant_id", |r| api_handler(r, tenant_status))
+        .delete("/v1/tenant/:tenant_id", |r| {
+            api_handler(r, tenant_delete_handler)
+        })
         .get("/v1/tenant/:tenant_id/synthetic_size", |r| {
             api_handler(r, tenant_size_handler)
         })

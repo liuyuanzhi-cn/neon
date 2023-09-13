@@ -8,7 +8,7 @@ mod layer_desc;
 mod remote_layer;
 
 use crate::config::PageServerConf;
-use crate::context::RequestContext;
+use crate::context::{AccessStatsBehavior, RequestContext};
 use crate::repository::Key;
 use crate::task_mgr::TaskKind;
 use crate::walrecord::NeonWalRecord;
@@ -40,8 +40,6 @@ pub use image_layer::{ImageLayer, ImageLayerWriter};
 pub use inmemory_layer::InMemoryLayer;
 pub use layer_desc::{PersistentLayerDesc, PersistentLayerKey};
 pub use remote_layer::RemoteLayer;
-
-use super::timeline::layer_manager::LayerManager;
 
 pub fn range_overlaps<T>(a: &Range<T>, b: &Range<T>) -> bool
 where
@@ -175,16 +173,9 @@ impl LayerAccessStats {
     ///
     /// [`LayerLoad`]: LayerResidenceEventReason::LayerLoad
     /// [`record_residence_event`]: Self::record_residence_event
-    pub(crate) fn for_loading_layer(
-        layer_map_lock_held_witness: &LayerManager,
-        status: LayerResidenceStatus,
-    ) -> Self {
+    pub(crate) fn for_loading_layer(status: LayerResidenceStatus) -> Self {
         let new = LayerAccessStats(Mutex::new(LayerAccessStatsLocked::default()));
-        new.record_residence_event(
-            layer_map_lock_held_witness,
-            status,
-            LayerResidenceEventReason::LayerLoad,
-        );
+        new.record_residence_event(status, LayerResidenceEventReason::LayerLoad);
         new
     }
 
@@ -197,7 +188,6 @@ impl LayerAccessStats {
     /// [`record_residence_event`]: Self::record_residence_event
     pub(crate) fn clone_for_residence_change(
         &self,
-        layer_map_lock_held_witness: &LayerManager,
         new_status: LayerResidenceStatus,
     ) -> LayerAccessStats {
         let clone = {
@@ -205,11 +195,7 @@ impl LayerAccessStats {
             inner.clone()
         };
         let new = LayerAccessStats(Mutex::new(clone));
-        new.record_residence_event(
-            layer_map_lock_held_witness,
-            new_status,
-            LayerResidenceEventReason::ResidenceChange,
-        );
+        new.record_residence_event(new_status, LayerResidenceEventReason::ResidenceChange);
         new
     }
 
@@ -229,7 +215,6 @@ impl LayerAccessStats {
     ///
     pub(crate) fn record_residence_event(
         &self,
-        _layer_map_lock_held_witness: &LayerManager,
         status: LayerResidenceStatus,
         reason: LayerResidenceEventReason,
     ) {
@@ -241,10 +226,14 @@ impl LayerAccessStats {
         });
     }
 
-    fn record_access(&self, access_kind: LayerAccessKind, task_kind: TaskKind) {
+    fn record_access(&self, access_kind: LayerAccessKind, ctx: &RequestContext) {
+        if ctx.access_stats_behavior() == AccessStatsBehavior::Skip {
+            return;
+        }
+
         let this_access = LayerAccessStatFullDetails {
             when: SystemTime::now(),
-            task_kind,
+            task_kind: ctx.task_kind(),
             access_kind,
         };
 
@@ -252,7 +241,7 @@ impl LayerAccessStats {
         locked.iter_mut().for_each(|inner| {
             inner.first_access.get_or_insert(this_access);
             inner.count_by_access_kind[access_kind] += 1;
-            inner.task_kind_flag |= task_kind;
+            inner.task_kind_flag |= ctx.task_kind();
             inner.last_accesses.write(this_access);
         })
     }
@@ -340,23 +329,6 @@ impl LayerAccessStats {
 /// are used in (timeline).
 #[async_trait::async_trait]
 pub trait Layer: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static {
-    /// Range of keys that this layer covers
-    fn get_key_range(&self) -> Range<Key>;
-
-    /// Inclusive start bound of the LSN range that this layer holds
-    /// Exclusive end bound of the LSN range that this layer holds.
-    ///
-    /// - For an open in-memory layer, this is MAX_LSN.
-    /// - For a frozen in-memory layer or a delta layer, this is a valid end bound.
-    /// - An image layer represents snapshot at one LSN, so end_lsn is always the snapshot LSN + 1
-    fn get_lsn_range(&self) -> Range<Lsn>;
-
-    /// Does this layer only contain some data for the key-range (incremental),
-    /// or does it contain a version of every page? This is important to know
-    /// for garbage collecting old layers: an incremental layer depends on
-    /// the previous non-incremental layer.
-    fn is_incremental(&self) -> bool;
-
     ///
     /// Return data needed to reconstruct given page at LSN.
     ///
@@ -376,9 +348,6 @@ pub trait Layer: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static {
         reconstruct_data: &mut ValueReconstructState,
         ctx: &RequestContext,
     ) -> Result<ValueReconstructResult>;
-
-    /// Dump summary of the contents of the layer to stdout
-    async fn dump(&self, verbose: bool, ctx: &RequestContext) -> Result<()>;
 }
 
 /// Get a layer descriptor from a layer.
@@ -401,16 +370,6 @@ pub trait AsLayerDesc {
 /// An image layer is a snapshot of all the data in a key-range, at a single
 /// LSN.
 pub trait PersistentLayer: Layer + AsLayerDesc {
-    /// Identify the tenant this layer belongs to
-    fn get_tenant_id(&self) -> TenantId {
-        self.layer_desc().tenant_id
-    }
-
-    /// Identify the timeline this layer belongs to
-    fn get_timeline_id(&self) -> TimelineId {
-        self.layer_desc().timeline_id
-    }
-
     /// File name used for this layer, both in the pageserver's local filesystem
     /// state as well as in the remote storage.
     fn filename(&self) -> LayerFileName {
@@ -434,14 +393,6 @@ pub trait PersistentLayer: Layer + AsLayerDesc {
 
     fn is_remote_layer(&self) -> bool {
         false
-    }
-
-    /// Returns None if the layer file size is not known.
-    ///
-    /// Should not change over the lifetime of the layer object because
-    /// current_physical_size is computed as the som of this value.
-    fn file_size(&self) -> u64 {
-        self.layer_desc().file_size
     }
 
     fn info(&self, reset: LayerAccessStatsReset) -> HistoricLayerInfo;
@@ -481,7 +432,6 @@ pub mod tests {
                 TimelineId::from_array([0; 16]),
                 value.key_range,
                 value.lsn,
-                false,
                 233,
             )
         }

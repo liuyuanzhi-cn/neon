@@ -1,12 +1,12 @@
 use metrics::metric_vec_duration::DurationResultObserver;
 use metrics::{
-    register_counter_vec, register_histogram, register_histogram_vec, register_int_counter,
-    register_int_counter_vec, register_int_gauge, register_int_gauge_vec, register_uint_gauge,
-    register_uint_gauge_vec, Counter, CounterVec, Histogram, HistogramVec, IntCounter,
-    IntCounterVec, IntGauge, IntGaugeVec, UIntGauge, UIntGaugeVec,
+    register_counter_vec, register_gauge_vec, register_histogram, register_histogram_vec,
+    register_int_counter, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
+    register_uint_gauge, register_uint_gauge_vec, Counter, CounterVec, GaugeVec, Histogram,
+    HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, UIntGauge, UIntGaugeVec,
 };
 use once_cell::sync::Lazy;
-use strum::VariantNames;
+use strum::{EnumCount, IntoEnumIterator, VariantNames};
 use strum_macros::{EnumVariantNames, IntoStaticStr};
 use utils::id::{TenantId, TimelineId};
 
@@ -394,6 +394,35 @@ pub(crate) static UNEXPECTED_ONDEMAND_DOWNLOADS: Lazy<IntCounter> = Lazy::new(||
     .expect("failed to define a metric")
 });
 
+/// How long did we take to start up?  Broken down by labels to describe
+/// different phases of startup.
+pub static STARTUP_DURATION: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "pageserver_startup_duration_seconds",
+        "Time taken by phases of pageserver startup, in seconds",
+        &["phase"]
+    )
+    .expect("Failed to register pageserver_startup_duration_seconds metric")
+});
+
+pub static STARTUP_IS_LOADING: Lazy<UIntGauge> = Lazy::new(|| {
+    register_uint_gauge!(
+        "pageserver_startup_is_loading",
+        "1 while in initial startup load of tenants, 0 at other times"
+    )
+    .expect("Failed to register pageserver_startup_is_loading")
+});
+
+/// How long did tenants take to go from construction to active state?
+pub(crate) static TENANT_ACTIVATION: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "pageserver_tenant_activation_seconds",
+        "Time taken by tenants to activate, in seconds",
+        CRITICAL_OP_BUCKETS.into()
+    )
+    .expect("Failed to register pageserver_tenant_activation_seconds metric")
+});
+
 /// Each `Timeline`'s  [`EVICTIONS_WITH_LOW_RESIDENCE_DURATION`] metric.
 #[derive(Debug)]
 pub struct EvictionsWithLowResidenceDuration {
@@ -508,7 +537,7 @@ const STORAGE_IO_TIME_BUCKETS: &[f64] = &[
     30.000,   // 30000 ms
 ];
 
-/// Tracks time taken by fs operations near VirtualFile.
+/// VirtualFile fs operation variants.
 ///
 /// Operations:
 /// - open ([`std::fs::OpenOptions::open`])
@@ -519,15 +548,66 @@ const STORAGE_IO_TIME_BUCKETS: &[f64] = &[
 /// - seek (modify internal position or file length query)
 /// - fsync ([`std::fs::File::sync_all`])
 /// - metadata ([`std::fs::File::metadata`])
-pub(crate) static STORAGE_IO_TIME: Lazy<HistogramVec> = Lazy::new(|| {
-    register_histogram_vec!(
-        "pageserver_io_operations_seconds",
-        "Time spent in IO operations",
-        &["operation"],
-        STORAGE_IO_TIME_BUCKETS.into()
-    )
-    .expect("failed to define a metric")
-});
+#[derive(
+    Debug, Clone, Copy, strum_macros::EnumCount, strum_macros::EnumIter, strum_macros::FromRepr,
+)]
+pub(crate) enum StorageIoOperation {
+    Open,
+    Close,
+    CloseByReplace,
+    Read,
+    Write,
+    Seek,
+    Fsync,
+    Metadata,
+}
+
+impl StorageIoOperation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StorageIoOperation::Open => "open",
+            StorageIoOperation::Close => "close",
+            StorageIoOperation::CloseByReplace => "close-by-replace",
+            StorageIoOperation::Read => "read",
+            StorageIoOperation::Write => "write",
+            StorageIoOperation::Seek => "seek",
+            StorageIoOperation::Fsync => "fsync",
+            StorageIoOperation::Metadata => "metadata",
+        }
+    }
+}
+
+/// Tracks time taken by fs operations near VirtualFile.
+#[derive(Debug)]
+pub(crate) struct StorageIoTime {
+    metrics: [Histogram; StorageIoOperation::COUNT],
+}
+
+impl StorageIoTime {
+    fn new() -> Self {
+        let storage_io_histogram_vec = register_histogram_vec!(
+            "pageserver_io_operations_seconds",
+            "Time spent in IO operations",
+            &["operation"],
+            STORAGE_IO_TIME_BUCKETS.into()
+        )
+        .expect("failed to define a metric");
+        let metrics = std::array::from_fn(|i| {
+            let op = StorageIoOperation::from_repr(i).unwrap();
+            let metric = storage_io_histogram_vec
+                .get_metric_with_label_values(&[op.as_str()])
+                .unwrap();
+            metric
+        });
+        Self { metrics }
+    }
+
+    pub(crate) fn get(&self, op: StorageIoOperation) -> &Histogram {
+        &self.metrics[op as usize]
+    }
+}
+
+pub(crate) static STORAGE_IO_TIME_METRIC: Lazy<StorageIoTime> = Lazy::new(StorageIoTime::new);
 
 const STORAGE_IO_SIZE_OPERATIONS: &[&str] = &["read", "write"];
 
@@ -541,22 +621,159 @@ pub(crate) static STORAGE_IO_SIZE: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("failed to define a metric")
 });
 
-const SMGR_QUERY_TIME_OPERATIONS: &[&str] = &[
-    "get_rel_exists",
-    "get_rel_size",
-    "get_page_at_lsn",
-    "get_db_size",
-];
+#[derive(Debug)]
+struct GlobalAndPerTimelineHistogram {
+    global: Histogram,
+    per_tenant_timeline: Histogram,
+}
 
-pub static SMGR_QUERY_TIME: Lazy<HistogramVec> = Lazy::new(|| {
+impl GlobalAndPerTimelineHistogram {
+    fn observe(&self, value: f64) {
+        self.global.observe(value);
+        self.per_tenant_timeline.observe(value);
+    }
+}
+
+struct GlobalAndPerTimelineHistogramTimer<'a> {
+    h: &'a GlobalAndPerTimelineHistogram,
+    start: std::time::Instant,
+}
+
+impl<'a> Drop for GlobalAndPerTimelineHistogramTimer<'a> {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        self.h.observe(elapsed.as_secs_f64());
+    }
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    IntoStaticStr,
+    strum_macros::EnumCount,
+    strum_macros::EnumIter,
+    strum_macros::FromRepr,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum SmgrQueryType {
+    GetRelExists,
+    GetRelSize,
+    GetPageAtLsn,
+    GetDbSize,
+}
+
+#[derive(Debug)]
+pub struct SmgrQueryTimePerTimeline {
+    metrics: [GlobalAndPerTimelineHistogram; SmgrQueryType::COUNT],
+}
+
+static SMGR_QUERY_TIME_PER_TENANT_TIMELINE: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
         "pageserver_smgr_query_seconds",
-        "Time spent on smgr query handling",
+        "Time spent on smgr query handling, aggegated by query type and tenant/timeline.",
         &["smgr_query_type", "tenant_id", "timeline_id"],
         CRITICAL_OP_BUCKETS.into(),
     )
     .expect("failed to define a metric")
 });
+
+static SMGR_QUERY_TIME_GLOBAL: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "pageserver_smgr_query_seconds_global",
+        "Time spent on smgr query handling, aggregated by query type.",
+        &["smgr_query_type"],
+        CRITICAL_OP_BUCKETS.into(),
+    )
+    .expect("failed to define a metric")
+});
+
+impl SmgrQueryTimePerTimeline {
+    pub(crate) fn new(tenant_id: &TenantId, timeline_id: &TimelineId) -> Self {
+        let tenant_id = tenant_id.to_string();
+        let timeline_id = timeline_id.to_string();
+        let metrics = std::array::from_fn(|i| {
+            let op = SmgrQueryType::from_repr(i).unwrap();
+            let global = SMGR_QUERY_TIME_GLOBAL
+                .get_metric_with_label_values(&[op.into()])
+                .unwrap();
+            let per_tenant_timeline = SMGR_QUERY_TIME_PER_TENANT_TIMELINE
+                .get_metric_with_label_values(&[op.into(), &tenant_id, &timeline_id])
+                .unwrap();
+            GlobalAndPerTimelineHistogram {
+                global,
+                per_tenant_timeline,
+            }
+        });
+        Self { metrics }
+    }
+    pub(crate) fn start_timer(&self, op: SmgrQueryType) -> impl Drop + '_ {
+        let metric = &self.metrics[op as usize];
+        GlobalAndPerTimelineHistogramTimer {
+            h: metric,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod smgr_query_time_tests {
+    use strum::IntoEnumIterator;
+    use utils::id::{TenantId, TimelineId};
+
+    // Regression test, we used hard-coded string constants before using an enum.
+    #[test]
+    fn op_label_name() {
+        use super::SmgrQueryType::*;
+        let expect: [(super::SmgrQueryType, &'static str); 4] = [
+            (GetRelExists, "get_rel_exists"),
+            (GetRelSize, "get_rel_size"),
+            (GetPageAtLsn, "get_page_at_lsn"),
+            (GetDbSize, "get_db_size"),
+        ];
+        for (op, expect) in expect {
+            let actual: &'static str = op.into();
+            assert_eq!(actual, expect);
+        }
+    }
+
+    #[test]
+    fn basic() {
+        let ops: Vec<_> = super::SmgrQueryType::iter().collect();
+
+        for op in &ops {
+            let tenant_id = TenantId::generate();
+            let timeline_id = TimelineId::generate();
+            let metrics = super::SmgrQueryTimePerTimeline::new(&tenant_id, &timeline_id);
+
+            let get_counts = || {
+                let global: u64 = ops
+                    .iter()
+                    .map(|op| metrics.metrics[*op as usize].global.get_sample_count())
+                    .sum();
+                let per_tenant_timeline: u64 = ops
+                    .iter()
+                    .map(|op| {
+                        metrics.metrics[*op as usize]
+                            .per_tenant_timeline
+                            .get_sample_count()
+                    })
+                    .sum();
+                (global, per_tenant_timeline)
+            };
+
+            let (pre_global, pre_per_tenant_timeline) = get_counts();
+            assert_eq!(pre_per_tenant_timeline, 0);
+
+            let timer = metrics.start_timer(*op);
+            drop(timer);
+
+            let (post_global, post_per_tenant_timeline) = get_counts();
+            assert_eq!(post_per_tenant_timeline, 1);
+            assert!(post_global > pre_global);
+        }
+    }
+}
 
 // keep in sync with control plane Go code so that we can validate
 // compute's basebackup_ms metric with our perspective in the context of SLI/SLO.
@@ -999,6 +1216,12 @@ impl TimelineMetrics {
             ),
         }
     }
+
+    pub fn record_new_file_metrics(&self, sz: u64) {
+        self.resident_physical_size_gauge.add(sz);
+        self.num_persistent_files_created.inc_by(1);
+        self.persistent_bytes_written.inc_by(sz);
+    }
 }
 
 impl Drop for TimelineMetrics {
@@ -1016,6 +1239,12 @@ impl Drop for TimelineMetrics {
             .write()
             .unwrap()
             .remove(tenant_id, timeline_id);
+
+        // The following metrics are born outside of the TimelineMetrics lifecycle but still
+        // removed at the end of it. The idea is to have the metrics outlive the
+        // entity during which they're observed, e.g., the smgr metrics shall
+        // outlive an individual smgr connection, but not the timeline.
+
         for op in StorageTimeOperation::VARIANTS {
             let _ =
                 STORAGE_TIME_SUM_PER_TIMELINE.remove_label_values(&[op, tenant_id, timeline_id]);
@@ -1027,8 +1256,12 @@ impl Drop for TimelineMetrics {
             let _ = STORAGE_IO_SIZE.remove_label_values(&[op, tenant_id, timeline_id]);
         }
 
-        for op in SMGR_QUERY_TIME_OPERATIONS {
-            let _ = SMGR_QUERY_TIME.remove_label_values(&[op, tenant_id, timeline_id]);
+        for op in SmgrQueryType::iter() {
+            let _ = SMGR_QUERY_TIME_PER_TENANT_TIMELINE.remove_label_values(&[
+                op.into(),
+                tenant_id,
+                timeline_id,
+            ]);
         }
     }
 }

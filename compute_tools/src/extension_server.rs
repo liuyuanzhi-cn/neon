@@ -73,10 +73,10 @@ More specifically, here is an example ext_index.json
 */
 use anyhow::Context;
 use anyhow::{self, Result};
-use futures::future::join_all;
+use compute_api::spec::RemoteExtSpec;
+use regex::Regex;
 use remote_storage::*;
 use serde_json;
-use std::collections::HashMap;
 use std::io::Read;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::Path;
@@ -107,83 +107,69 @@ fn get_pg_config(argument: &str, pgbin: &str) -> String {
 
 pub fn get_pg_version(pgbin: &str) -> String {
     // pg_config --version returns a (platform specific) human readable string
-    // such as "PostgreSQL 15.4". We parse this to v14/v15
+    // such as "PostgreSQL 15.4". We parse this to v14/v15/v16 etc.
     let human_version = get_pg_config("--version", pgbin);
-    if human_version.contains("15") {
-        return "v15".to_string();
-    } else if human_version.contains("14") {
-        return "v14".to_string();
+    return parse_pg_version(&human_version).to_string();
+}
+
+fn parse_pg_version(human_version: &str) -> &str {
+    // Normal releases have version strings like "PostgreSQL 15.4". But there
+    // are also pre-release versions like "PostgreSQL 17devel" or "PostgreSQL
+    // 16beta2" or "PostgreSQL 17rc1". And with the --with-extra-version
+    // configure option, you can tack any string to the version number,
+    // e.g. "PostgreSQL 15.4foobar".
+    match Regex::new(r"^PostgreSQL (?<major>\d+).+")
+        .unwrap()
+        .captures(human_version)
+    {
+        Some(captures) if captures.len() == 2 => match &captures["major"] {
+            "14" => return "v14",
+            "15" => return "v15",
+            "16" => return "v16",
+            _ => {}
+        },
+        _ => {}
     }
     panic!("Unsuported postgres version {human_version}");
 }
 
-// download control files for enabled_extensions
-// return Hashmaps converting library names to extension names (library_index)
-// and specifying the remote path to the archive for each extension name
-pub async fn get_available_extensions(
-    remote_storage: &GenericRemoteStorage,
-    pgbin: &str,
-    pg_version: &str,
-    custom_extensions: &[String],
-    build_tag: &str,
-) -> Result<(HashMap<String, RemotePath>, HashMap<String, String>)> {
-    let local_sharedir = Path::new(&get_pg_config("--sharedir", pgbin)).join("extension");
-    let index_path = format!("{build_tag}/{pg_version}/ext_index.json");
-    let index_path = RemotePath::new(Path::new(&index_path)).context("error forming path")?;
-    info!("download ext_index.json from: {:?}", &index_path);
+#[cfg(test)]
+mod tests {
+    use super::parse_pg_version;
 
-    let mut download = remote_storage.download(&index_path).await?;
-    let mut ext_idx_buffer = Vec::new();
-    download
-        .download_stream
-        .read_to_end(&mut ext_idx_buffer)
-        .await?;
-    info!("ext_index downloaded");
+    #[test]
+    fn test_parse_pg_version() {
+        assert_eq!(parse_pg_version("PostgreSQL 15.4"), "v15");
+        assert_eq!(parse_pg_version("PostgreSQL 15.14"), "v15");
+        assert_eq!(
+            parse_pg_version("PostgreSQL 15.4 (Ubuntu 15.4-0ubuntu0.23.04.1)"),
+            "v15"
+        );
 
-    #[derive(Debug, serde::Deserialize)]
-    struct Index {
-        public_extensions: Vec<String>,
-        library_index: HashMap<String, String>,
-        extension_data: HashMap<String, ExtensionData>,
+        assert_eq!(parse_pg_version("PostgreSQL 14.15"), "v14");
+        assert_eq!(parse_pg_version("PostgreSQL 14.0"), "v14");
+        assert_eq!(
+            parse_pg_version("PostgreSQL 14.9 (Debian 14.9-1.pgdg120+1"),
+            "v14"
+        );
+
+        assert_eq!(parse_pg_version("PostgreSQL 16devel"), "v16");
+        assert_eq!(parse_pg_version("PostgreSQL 16beta1"), "v16");
+        assert_eq!(parse_pg_version("PostgreSQL 16rc2"), "v16");
+        assert_eq!(parse_pg_version("PostgreSQL 16extra"), "v16");
     }
 
-    #[derive(Debug, serde::Deserialize)]
-    struct ExtensionData {
-        control_data: HashMap<String, String>,
-        archive_path: String,
+    #[test]
+    #[should_panic]
+    fn test_parse_pg_unsupported_version() {
+        parse_pg_version("PostgreSQL 13.14");
     }
 
-    let ext_index_full = serde_json::from_slice::<Index>(&ext_idx_buffer)?;
-    let mut enabled_extensions = ext_index_full.public_extensions;
-    enabled_extensions.extend_from_slice(custom_extensions);
-    let library_index = ext_index_full.library_index;
-    let all_extension_data = ext_index_full.extension_data;
-    info!("library_index: {:?}", library_index);
-
-    info!("enabled_extensions: {:?}", enabled_extensions);
-    let mut ext_remote_paths = HashMap::new();
-    let mut file_create_tasks = Vec::new();
-    for extension in enabled_extensions {
-        let ext_data = &all_extension_data[&extension];
-        for (control_file, control_contents) in &ext_data.control_data {
-            let extension_name = control_file
-                .strip_suffix(".control")
-                .expect("control files must end in .control");
-            ext_remote_paths.insert(
-                extension_name.to_string(),
-                RemotePath::from_string(&ext_data.archive_path)?,
-            );
-            let control_path = local_sharedir.join(control_file);
-            info!("writing file {:?}{:?}", control_path, control_contents);
-            file_create_tasks.push(tokio::fs::write(control_path, control_contents));
-        }
+    #[test]
+    #[should_panic]
+    fn test_parse_pg_incorrect_version_format() {
+        parse_pg_version("PostgreSQL 14");
     }
-    let results = join_all(file_create_tasks).await;
-    for result in results {
-        result?;
-    }
-    info!("ext_remote_paths {:?}", ext_remote_paths);
-    Ok((ext_remote_paths, library_index))
 }
 
 // download the archive for a given extension,
@@ -222,7 +208,7 @@ pub async fn download_extension(
     );
     let libdir_paths = (
         unzip_dest.to_string() + "/lib",
-        Path::new(&get_pg_config("--libdir", pgbin)).join("postgresql"),
+        Path::new(&get_pg_config("--pkglibdir", pgbin)).to_path_buf(),
     );
     // move contents of the libdir / sharedir in unzipped archive to the correct local paths
     for paths in [sharedir_paths, libdir_paths] {
@@ -245,6 +231,34 @@ pub async fn download_extension(
     }
     info!("done moving extension {ext_name}");
     Ok(download_size)
+}
+
+// Create extension control files from spec
+pub fn create_control_files(remote_extensions: &RemoteExtSpec, pgbin: &str) {
+    let local_sharedir = Path::new(&get_pg_config("--sharedir", pgbin)).join("extension");
+    for (ext_name, ext_data) in remote_extensions.extension_data.iter() {
+        // Check if extension is present in public or custom.
+        // If not, then it is not allowed to be used by this compute.
+        if let Some(public_extensions) = &remote_extensions.public_extensions {
+            if !public_extensions.contains(ext_name) {
+                if let Some(custom_extensions) = &remote_extensions.custom_extensions {
+                    if !custom_extensions.contains(ext_name) {
+                        continue; // skip this extension, it is not allowed
+                    }
+                }
+            }
+        }
+
+        for (control_name, control_content) in &ext_data.control_data {
+            let control_path = local_sharedir.join(control_name);
+            if !control_path.exists() {
+                info!("writing file {:?}{:?}", control_path, control_content);
+                std::fs::write(control_path, control_content).unwrap();
+            } else {
+                warn!("control file {:?} exists both locally and remotely. ignoring the remote version.", control_path);
+            }
+        }
+    }
 }
 
 // This function initializes the necessary structs to use remote storage

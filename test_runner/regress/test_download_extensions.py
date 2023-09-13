@@ -9,8 +9,12 @@ from fixtures.log_helper import log
 from fixtures.neon_fixtures import (
     NeonEnvBuilder,
 )
-from fixtures.pg_version import PgVersion
-from fixtures.remote_storage import RemoteStorageKind, available_s3_storages
+from fixtures.pg_version import PgVersion, skip_on_postgres
+from fixtures.remote_storage import (
+    RemoteStorageKind,
+    S3Storage,
+    available_s3_storages,
+)
 
 
 # Cleaning up downloaded files is important for local tests
@@ -72,7 +76,8 @@ def upload_files(env):
 
             with open(full_path, "rb") as f:
                 log.info(f"UPLOAD {full_path} to ext/{full_path}")
-                env.remote_storage_client.upload_fileobj(
+                assert isinstance(env.pageserver_remote_storage, S3Storage)
+                env.pageserver_remote_storage.client.upload_fileobj(
                     f,
                     env.ext_remote_storage.bucket_name,
                     f"ext/{full_path}",
@@ -81,23 +86,20 @@ def upload_files(env):
 
 
 # Test downloading remote extension.
+@skip_on_postgres(PgVersion.V16, reason="TODO: PG16 extension building")
 @pytest.mark.parametrize("remote_storage_kind", available_s3_storages())
+@pytest.mark.skip(reason="https://github.com/neondatabase/neon/issues/4949")
 def test_remote_extensions(
     neon_env_builder: NeonEnvBuilder,
     remote_storage_kind: RemoteStorageKind,
     pg_version: PgVersion,
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_remote_extensions",
-        enable_remote_extensions=True,
-    )
+    neon_env_builder.enable_extensions_remote_storage(remote_storage_kind)
     env = neon_env_builder.init_start()
     tenant_id, _ = env.neon_cli.create_tenant()
     env.neon_cli.create_timeline("test_remote_extensions", tenant_id=tenant_id)
 
     assert env.ext_remote_storage is not None  # satisfy mypy
-    assert env.remote_storage_client is not None  # satisfy mypy
 
     # For MOCK_S3 we upload test files.
     # For REAL_S3 we use the files already in the bucket
@@ -147,23 +149,20 @@ def test_remote_extensions(
 
 
 # Test downloading remote library.
+@skip_on_postgres(PgVersion.V16, reason="TODO: PG16 extension building")
 @pytest.mark.parametrize("remote_storage_kind", available_s3_storages())
+@pytest.mark.skip(reason="https://github.com/neondatabase/neon/issues/4949")
 def test_remote_library(
     neon_env_builder: NeonEnvBuilder,
     remote_storage_kind: RemoteStorageKind,
     pg_version: PgVersion,
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_remote_library",
-        enable_remote_extensions=True,
-    )
+    neon_env_builder.enable_extensions_remote_storage(remote_storage_kind)
     env = neon_env_builder.init_start()
     tenant_id, _ = env.neon_cli.create_tenant()
     env.neon_cli.create_timeline("test_remote_library", tenant_id=tenant_id)
 
     assert env.ext_remote_storage is not None  # satisfy mypy
-    assert env.remote_storage_client is not None  # satisfy mypy
 
     # For MOCK_S3 we upload test files.
     # For REAL_S3 we use the files already in the bucket
@@ -205,25 +204,22 @@ def test_remote_library(
 # Here we test a complex extension
 # which has multiple extensions in one archive
 # using postgis as an example
-@pytest.mark.skipif(
-    RemoteStorageKind.REAL_S3 not in available_s3_storages(),
-    reason="skipping test because real s3 not enabled",
-)
+# @pytest.mark.skipif(
+#    RemoteStorageKind.REAL_S3 not in available_s3_storages(),
+#    reason="skipping test because real s3 not enabled",
+# )
+@skip_on_postgres(PgVersion.V16, reason="TODO: PG16 extension building")
+@pytest.mark.skip(reason="https://github.com/neondatabase/neon/issues/4949")
 def test_multiple_extensions_one_archive(
     neon_env_builder: NeonEnvBuilder,
     pg_version: PgVersion,
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=RemoteStorageKind.REAL_S3,
-        test_name="test_multiple_extensions_one_archive",
-        enable_remote_extensions=True,
-    )
+    neon_env_builder.enable_extensions_remote_storage(RemoteStorageKind.REAL_S3)
     env = neon_env_builder.init_start()
     tenant_id, _ = env.neon_cli.create_tenant()
     env.neon_cli.create_timeline("test_multiple_extensions_one_archive", tenant_id=tenant_id)
 
     assert env.ext_remote_storage is not None  # satisfy mypy
-    assert env.remote_storage_client is not None  # satisfy mypy
 
     endpoint = env.endpoints.create_start(
         "test_multiple_extensions_one_archive",
@@ -253,24 +249,21 @@ def test_multiple_extensions_one_archive(
 # Run the test with mutliple simultaneous connections to an endpoint.
 # to ensure that the extension is downloaded only once.
 #
+@pytest.mark.skip(reason="https://github.com/neondatabase/neon/issues/4949")
 def test_extension_download_after_restart(
     neon_env_builder: NeonEnvBuilder,
     pg_version: PgVersion,
 ):
-    if "15" in pg_version:  # SKIP v15 for now because test set only has extension built for v14
+    # TODO: PG15 + PG16 extension building
+    if "v14" not in pg_version:  # test set only has extension built for v14
         return None
 
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=RemoteStorageKind.MOCK_S3,
-        test_name="test_extension_download_after_restart",
-        enable_remote_extensions=True,
-    )
+    neon_env_builder.enable_extensions_remote_storage(RemoteStorageKind.MOCK_S3)
     env = neon_env_builder.init_start()
     tenant_id, _ = env.neon_cli.create_tenant()
     env.neon_cli.create_timeline("test_extension_download_after_restart", tenant_id=tenant_id)
 
     assert env.ext_remote_storage is not None  # satisfy mypy
-    assert env.remote_storage_client is not None  # satisfy mypy
 
     # For MOCK_S3 we upload test files.
     upload_files(env)

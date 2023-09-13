@@ -44,10 +44,7 @@ def test_tenant_reattach(
     neon_env_builder: NeonEnvBuilder,
     remote_storage_kind: RemoteStorageKind,
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_tenant_reattach",
-    )
+    neon_env_builder.enable_pageserver_remote_storage(remote_storage_kind)
 
     # Exercise retry code path by making all uploads and downloads fail for the
     # first time. The retries print INFO-messages to the log; we will check
@@ -65,6 +62,10 @@ def test_tenant_reattach(
     env.pageserver.allowed_errors.append(f".*Tenant {tenant_id} not found.*")
     env.pageserver.allowed_errors.append(
         f".*Tenant {tenant_id} will not become active\\. Current state: Stopping.*"
+    )
+    # Thats because of UnreliableWrapper's injected failures
+    env.pageserver.allowed_errors.append(
+        f".*failed to fetch tenant deletion mark at tenants/({tenant_id}|{env.initial_tenant})/deleted attempt 1.*"
     )
 
     with env.endpoints.create_start("main", tenant_id=tenant_id) as endpoint:
@@ -225,10 +226,7 @@ def test_tenant_reattach_while_busy(
     neon_env_builder: NeonEnvBuilder,
     remote_storage_kind: RemoteStorageKind,
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_tenant_reattach_while_busy",
-    )
+    neon_env_builder.enable_pageserver_remote_storage(remote_storage_kind)
     env = neon_env_builder.init_start()
 
     pageserver_http = env.pageserver.http_client()
@@ -291,7 +289,7 @@ def test_tenant_detach_smoke(neon_env_builder: NeonEnvBuilder):
     )
 
     # assert tenant exists on disk
-    assert (env.repo_dir / "tenants" / str(tenant_id)).exists()
+    assert (env.pageserver.workdir / "tenants" / str(tenant_id)).exists()
 
     endpoint = env.endpoints.create_start("main", tenant_id=tenant_id)
     # we rely upon autocommit after each statement
@@ -334,7 +332,7 @@ def test_tenant_detach_smoke(neon_env_builder: NeonEnvBuilder):
     log.info("gc thread returned")
 
     # check that nothing is left on disk for deleted tenant
-    assert not (env.repo_dir / "tenants" / str(tenant_id)).exists()
+    assert not (env.pageserver.workdir / "tenants" / str(tenant_id)).exists()
 
     with pytest.raises(
         expected_exception=PageserverApiException, match=f"NotFound: tenant {tenant_id}"
@@ -359,7 +357,7 @@ def test_tenant_detach_ignored_tenant(neon_simple_env: NeonEnv):
     )
 
     # assert tenant exists on disk
-    assert (env.repo_dir / "tenants" / str(tenant_id)).exists()
+    assert (env.pageserver.workdir / "tenants" / str(tenant_id)).exists()
 
     endpoint = env.endpoints.create_start("main", tenant_id=tenant_id)
     # we rely upon autocommit after each statement
@@ -388,7 +386,7 @@ def test_tenant_detach_ignored_tenant(neon_simple_env: NeonEnv):
     log.info("ignored tenant detached without error")
 
     # check that nothing is left on disk for deleted tenant
-    assert not (env.repo_dir / "tenants" / str(tenant_id)).exists()
+    assert not (env.pageserver.workdir / "tenants" / str(tenant_id)).exists()
 
     # assert the tenant does not exists in the Pageserver
     tenants_after_detach = [tenant["id"] for tenant in client.tenant_list()]
@@ -415,7 +413,7 @@ def test_tenant_detach_regular_tenant(neon_simple_env: NeonEnv):
     )
 
     # assert tenant exists on disk
-    assert (env.repo_dir / "tenants" / str(tenant_id)).exists()
+    assert (env.pageserver.workdir / "tenants" / str(tenant_id)).exists()
 
     endpoint = env.endpoints.create_start("main", tenant_id=tenant_id)
     # we rely upon autocommit after each statement
@@ -432,7 +430,7 @@ def test_tenant_detach_regular_tenant(neon_simple_env: NeonEnv):
     log.info("regular tenant detached without error")
 
     # check that nothing is left on disk for deleted tenant
-    assert not (env.repo_dir / "tenants" / str(tenant_id)).exists()
+    assert not (env.pageserver.workdir / "tenants" / str(tenant_id)).exists()
 
     # assert the tenant does not exists in the Pageserver
     tenants_after_detach = [tenant["id"] for tenant in client.tenant_list()]
@@ -447,10 +445,7 @@ def test_detach_while_attaching(
     neon_env_builder: NeonEnvBuilder,
     remote_storage_kind: RemoteStorageKind,
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_detach_while_attaching",
-    )
+    neon_env_builder.enable_pageserver_remote_storage(remote_storage_kind)
 
     ##### First start, insert secret data and upload it to the remote storage
     env = neon_env_builder.init_start()
@@ -459,8 +454,8 @@ def test_detach_while_attaching(
 
     client = env.pageserver.http_client()
 
-    tenant_id = TenantId(endpoint.safe_psql("show neon.tenant_id")[0][0])
-    timeline_id = TimelineId(endpoint.safe_psql("show neon.timeline_id")[0][0])
+    tenant_id = env.initial_tenant
+    timeline_id = env.initial_timeline
 
     # Attempts to connect from compute to pageserver while the tenant is
     # temporarily detached produces these errors in the pageserver log.
@@ -531,15 +526,12 @@ def test_detach_while_attaching(
 def test_ignored_tenant_reattach(
     neon_env_builder: NeonEnvBuilder, remote_storage_kind: RemoteStorageKind
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_ignored_tenant_reattach",
-    )
+    neon_env_builder.enable_pageserver_remote_storage(remote_storage_kind)
     env = neon_env_builder.init_start()
     pageserver_http = env.pageserver.http_client()
 
     ignored_tenant_id, _ = env.neon_cli.create_tenant()
-    tenant_dir = env.repo_dir / "tenants" / str(ignored_tenant_id)
+    tenant_dir = env.pageserver.workdir / "tenants" / str(ignored_tenant_id)
     tenants_before_ignore = [tenant["id"] for tenant in pageserver_http.tenant_list()]
     tenants_before_ignore.sort()
     timelines_before_ignore = [
@@ -603,16 +595,13 @@ def test_ignored_tenant_reattach(
 def test_ignored_tenant_download_missing_layers(
     neon_env_builder: NeonEnvBuilder, remote_storage_kind: RemoteStorageKind
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_ignored_tenant_download_and_attach",
-    )
+    neon_env_builder.enable_pageserver_remote_storage(remote_storage_kind)
     env = neon_env_builder.init_start()
     pageserver_http = env.pageserver.http_client()
     endpoint = env.endpoints.create_start("main")
 
-    tenant_id = TenantId(endpoint.safe_psql("show neon.tenant_id")[0][0])
-    timeline_id = TimelineId(endpoint.safe_psql("show neon.timeline_id")[0][0])
+    tenant_id = env.initial_tenant
+    timeline_id = env.initial_timeline
 
     # Attempts to connect from compute to pageserver while the tenant is
     # temporarily detached produces these errors in the pageserver log.
@@ -669,22 +658,19 @@ def test_ignored_tenant_download_missing_layers(
 def test_ignored_tenant_stays_broken_without_metadata(
     neon_env_builder: NeonEnvBuilder, remote_storage_kind: RemoteStorageKind
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_ignored_tenant_stays_broken_without_metadata",
-    )
+    neon_env_builder.enable_pageserver_remote_storage(remote_storage_kind)
     env = neon_env_builder.init_start()
     pageserver_http = env.pageserver.http_client()
-    endpoint = env.endpoints.create_start("main")
+    env.endpoints.create_start("main")
 
-    tenant_id = TenantId(endpoint.safe_psql("show neon.tenant_id")[0][0])
-    timeline_id = TimelineId(endpoint.safe_psql("show neon.timeline_id")[0][0])
+    tenant_id = env.initial_tenant
+    timeline_id = env.initial_timeline
 
     # Attempts to connect from compute to pageserver while the tenant is
     # temporarily detached produces these errors in the pageserver log.
     env.pageserver.allowed_errors.append(f".*Tenant {tenant_id} not found.*")
     env.pageserver.allowed_errors.append(
-        f".*Tenant {tenant_id} will not become active\\. Current state: Broken.*"
+        f".*Tenant {tenant_id} will not become active\\. Current state: (Broken|Stopping).*"
     )
 
     # ignore the tenant and remove its metadata
@@ -713,15 +699,12 @@ def test_ignored_tenant_stays_broken_without_metadata(
 def test_load_attach_negatives(
     neon_env_builder: NeonEnvBuilder, remote_storage_kind: RemoteStorageKind
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_load_attach_negatives",
-    )
+    neon_env_builder.enable_pageserver_remote_storage(remote_storage_kind)
     env = neon_env_builder.init_start()
     pageserver_http = env.pageserver.http_client()
-    endpoint = env.endpoints.create_start("main")
+    env.endpoints.create_start("main")
 
-    tenant_id = TenantId(endpoint.safe_psql("show neon.tenant_id")[0][0])
+    tenant_id = env.initial_tenant
 
     # Attempts to connect from compute to pageserver while the tenant is
     # temporarily detached produces these errors in the pageserver log.
@@ -758,10 +741,7 @@ def test_ignore_while_attaching(
     neon_env_builder: NeonEnvBuilder,
     remote_storage_kind: RemoteStorageKind,
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_ignore_while_attaching",
-    )
+    neon_env_builder.enable_pageserver_remote_storage(remote_storage_kind)
 
     env = neon_env_builder.init_start()
     pageserver_http = env.pageserver.http_client()
@@ -769,8 +749,8 @@ def test_ignore_while_attaching(
 
     pageserver_http = env.pageserver.http_client()
 
-    tenant_id = TenantId(endpoint.safe_psql("show neon.tenant_id")[0][0])
-    timeline_id = TimelineId(endpoint.safe_psql("show neon.timeline_id")[0][0])
+    tenant_id = env.initial_tenant
+    timeline_id = env.initial_timeline
 
     # Attempts to connect from compute to pageserver while the tenant is
     # temporarily detached produces these errors in the pageserver log.
@@ -862,10 +842,7 @@ def test_metrics_while_ignoring_broken_tenant_and_reloading(
     neon_env_builder: NeonEnvBuilder,
     remote_storage_kind: RemoteStorageKind,
 ):
-    neon_env_builder.enable_remote_storage(
-        remote_storage_kind=remote_storage_kind,
-        test_name="test_metrics_while_ignoring_broken_tenant_and_reloading",
-    )
+    neon_env_builder.enable_pageserver_remote_storage(remote_storage_kind)
 
     env = neon_env_builder.init_start()
 
